@@ -1,0 +1,118 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: prad-cca-20yr
+  namespace: climate-analytics
+spec:
+  backoffLimit: 0
+  ttlSecondsAfterFinished: 86400
+  template:
+    spec:
+      restartPolicy: Never
+      containers:
+      - name: cca-container
+        image: pytorch/pytorch:2.6.0-cuda11.8-cudnn9-devel
+
+        env:
+        - name: PYTHONUNBUFFERED
+          value: "1"
+        - name: EMBED_DIR
+          value: /workspace/embeddings
+        - name: OUT_DIR
+          value: /workspace/results/cca_20yr
+        - name: CHECKPOINT
+          value: /workspace/vae_checkpoint/lightning_model_50_transform.pt
+        - name: MANIFEST
+          value: /workspace/repo/manifest.csv
+        - name: STREAM_STRIDE
+          value: "11"
+        - name: MAX_PER_DAY
+          value: "200"
+
+        command: ["/bin/bash", "-c"]
+        args:
+          - |
+            set -e
+
+            REPO_DIR=/workspace/repo
+            if [ ! -d "$REPO_DIR/.git" ]; then
+              git clone https://github.com/Pradyumna-SV/ucsd-cal-cloud-analysis $REPO_DIR
+            else
+              echo "Repo exists, pulling latest..."
+              cd $REPO_DIR && git reset --hard HEAD && git pull origin main
+            fi
+
+            pip install --quiet \
+              numpy pandas scipy scikit-learn \
+              xarray zarr gcsfs \
+              pytorch-lightning \
+              matplotlib
+
+            mkdir -p /workspace/results/cca_20yr
+            mkdir -p /workspace/logs
+
+            {
+              python3 $REPO_DIR/scripts/cca_20yr.py
+            } 2>&1 | tee "/workspace/logs/cca_20yr_$(hostname)_$(date +%Y%m%d_%H%M%S).log"
+
+        resources:
+          limits:
+            cpu: "8"
+            memory: "32Gi"
+            nvidia.com/gpu: "1"
+          requests:
+            cpu: "8"
+            memory: "32Gi"
+            nvidia.com/gpu: "1"
+
+        volumeMounts:
+        - name: embeddings-storage
+          mountPath: /workspace
+
+      volumes:
+      - name: embeddings-storage
+        persistentVolumeClaim:
+          claimName: prad-embeddings-5ti
+
+      tolerations:
+        - key: "nautilus.io/noceph"
+          operator: Exists
+          effect: NoSchedule
+        - key: "nautilus.io/group"
+          operator: Exists
+          effect: NoSchedule
+        - key: "kubernetes.io/arch"
+          value: "amd64"
+          operator: Equal
+          effect: NoSchedule
+
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+            - matchExpressions:
+              - key: nvidia.com/gpu.product
+                operator: In
+                values:
+                  - NVIDIA-A100-SXM4-80GB
+                  - NVIDIA-A100-80GB-PCIe
+                  - NVIDIA-RTX-A6000
+                  - Quadro-RTX-8000
+                  - NVIDIA-L40
+                  - NVIDIA-A40
+                  - Tesla-V100-SXM2-32GB
+                  - NVIDIA-A10
+                  - NVIDIA-GeForce-RTX-3090
+                  - NVIDIA-GeForce-RTX-4090
+                  - NVIDIA-RTX-A5000
+                  - NVIDIA-TITAN-RTX
+              - key: kubernetes.io/hostname
+                operator: NotIn
+                values:
+                  - sphinx.sdstate.edu
+                  - k8s-haosu-09.sdsc.optiputer.net
+                  - node-2-3.sdsc.optiputer.net
+                  - node-2-2.sdsc.optiputer.net
+                  - node-1-1.sdsc.optiputer.net
+                  - gp-engine.beocat.ksu.edu
+                  - gpengine-uams.areon.net
