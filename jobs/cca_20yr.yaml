@@ -41,7 +41,7 @@ spec:
               git clone https://github.com/Pradyumna-SV/ucsd-cal-cloud-analysis $REPO_DIR
             else
               echo "Repo exists, pulling latest..."
-              cd $REPO_DIR && git reset --hard HEAD && git pull origin main
+              cd $REPO_DIR && git reset --hard HEAD && git pull origin master
             fi
 
             pip install --quiet \
