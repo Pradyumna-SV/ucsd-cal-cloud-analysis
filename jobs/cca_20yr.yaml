@@ -34,6 +34,8 @@ spec:
           - |
             set -e
 
+            apt-get update -q && apt-get install -y -q git
+
             REPO_DIR=/workspace/repo
             if [ ! -d "$REPO_DIR/.git" ]; then
               git clone https://github.com/Pradyumna-SV/ucsd-cal-cloud-analysis $REPO_DIR
