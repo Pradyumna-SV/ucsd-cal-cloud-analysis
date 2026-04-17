@@ -154,7 +154,7 @@ def load_day(year, month, day):
     """
     Load one day's embeddings and metadata from the local PVC.
     Returns a DataFrame with columns: lat, lon, time, vae (2048-D array), t2v (50-D array).
-    Returns None if any required file is missing.
+    Returns None if any required file is missing, corrupt, or inconsistent.
     """
     prefix   = f"{year}_{month:02d}_{day:02d}"
     day_dir  = Path(EMBED_DIR) / str(year) / f"{month:02d}" / f"{day:02d}"
@@ -165,11 +165,19 @@ def load_day(year, month, day):
     if not (mean_p.exists() and t2v_p.exists() and meta_p.exists()):
         return None
 
-    vae_arr = np.load(mean_p).squeeze()    # (N, 2048)
-    t2v_arr = np.load(t2v_p).squeeze()    # (N, 50)
+    try:
+        vae_arr = np.load(mean_p).squeeze()    # (N, 2048)
+        t2v_arr = np.load(t2v_p).squeeze()    # (N, 50)
+    except Exception as e:
+        print(f"  [skip] {prefix}: corrupt npy ({e})")
+        return None
 
-    with open(meta_p) as f:
-        meta = json.load(f)
+    try:
+        with open(meta_p) as f:
+            meta = json.load(f)
+    except Exception as e:
+        print(f"  [skip] {prefix}: corrupt json ({e})")
+        return None
 
     rows, idx = [], 0
     for ts in sorted(meta.keys()):
@@ -178,8 +186,17 @@ def load_day(year, month, day):
                          "time": pd.Timestamp(ts)})
             idx += 1
 
-    if idx == 0 or idx != len(vae_arr):
+    if idx == 0:
+        print(f"  [skip] {prefix}: empty centers json")
         return None
+
+    # Truncate to the minimum consistent length across all three files
+    n = min(idx, len(vae_arr), len(t2v_arr))
+    if n < idx:
+        print(f"  [warn] {prefix}: array shorter than centers ({n} vs {idx} tiles), truncating")
+    rows = rows[:n]
+    vae_arr = vae_arr[:n]
+    t2v_arr = t2v_arr[:n]
 
     df = pd.DataFrame(rows)
     df["vae"] = list(vae_arr)
