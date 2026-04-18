@@ -86,8 +86,8 @@ def _match_var(ds, tree, df, varname, level=None):
     """Match a single ERA5 variable to a dataframe of (lat, lon, time) rows."""
     lats     = df["lat"].values
     lons     = df["lon"].values
-    times    = pd.to_datetime(df["time"])
-    lons_pos = np.where(lons < 0, lons + 360, lons)   # ERA5 uses 0-360
+    times    = pd.to_datetime(df["time"], errors="coerce")   # bad timestamps -> NaT
+    lons_pos = np.where(lons < 0, lons + 360, lons)          # ERA5 uses 0-360
     _, sp_idx = tree.query(np.column_stack([lats, lons_pos]))
     out      = np.full(len(df), np.nan)
 
@@ -95,20 +95,25 @@ def _match_var(ds, tree, df, varname, level=None):
     if level is not None:
         da = da.sel(level=level)
 
-    # Load one unique date at a time to stay memory-efficient
-    for date in np.unique(times.dt.date):
-        mask = times.dt.date == date
-        if not mask.any():
-            continue
+    # Filter to valid (non-NaT) timestamps only before calling .dt.date
+    valid_mask = times.notna()
+    if not valid_mask.any():
+        return out
+    valid_idx   = np.where(valid_mask)[0]
+    valid_times = times.iloc[valid_idx]
+
+    for date in np.unique(valid_times.dt.date):
+        in_date  = valid_times.dt.date == date
+        row_idxs = valid_idx[in_date.values]
         try:
             day_da    = da.sel(time=str(date)).load()
             day_times = pd.DatetimeIndex(day_da["time"].values)
             flat      = day_da.values.reshape(len(day_times), -1)
-            for i in np.where(mask)[0]:
+            for i in row_idxs:
                 ti = day_times.get_indexer([times.iloc[i]], method="nearest")[0]
                 if ti >= 0:
                     out[i] = float(flat[ti, sp_idx[i]])
-        except Exception as e:
+        except Exception:
             pass   # missing day in ERA5 — leave NaN
     return out
 
@@ -181,9 +186,12 @@ def load_day(year, month, day):
 
     rows, idx = [], 0
     for ts in sorted(meta.keys()):
+        try:
+            t = pd.Timestamp(ts)
+        except Exception:
+            t = pd.NaT
         for lat, lon in meta[ts]:
-            rows.append({"lat": float(lat), "lon": float(lon),
-                         "time": pd.Timestamp(ts)})
+            rows.append({"lat": float(lat), "lon": float(lon), "time": t})
             idx += 1
 
     if idx == 0:
