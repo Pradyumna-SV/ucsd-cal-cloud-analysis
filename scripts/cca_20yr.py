@@ -58,7 +58,7 @@ MAX_PER_DAY   = int(os.environ.get("MAX_PER_DAY",   200))
 # Contains: sea_surface_temperature, temperature (pressure levels),
 #           specific_humidity, geopotential, vertical_velocity,
 #           total_column_water_vapour, 2m_temperature
-ARCO_ERA5 = "gs://gcp-public-data-arco-era5/ar/full_37-1h-0p25deg-chunk-1_zarr-v3.zarr"
+ARCO_ERA5 = "gs://gcp-public-data-arco-era5/ar/full_37-1h-0p25deg-chunk-1.zarr-v3"
 
 N_PCA_VAE    = 50
 N_PCA_T2V    = 49
@@ -71,8 +71,8 @@ os.makedirs(OUT_DIR, exist_ok=True)
 # ── ERA5 setup ─────────────────────────────────────────────────────────────
 def open_era5():
     print("Opening ARCO-ERA5 (GCS, anonymous)...")
-    fs = gcsfs.GCSFileSystem(token="anon")
-    ds = xr.open_zarr(gcsfs.GCSMap(ARCO_ERA5, gcs=fs), consolidated=True)
+    gcs = gcsfs.GCSFileSystem(token="anon")
+    ds  = xr.open_zarr(gcs.get_mapper(ARCO_ERA5), chunks=None)
     lats = ds["latitude"].values
     lons = ds["longitude"].values
     lon_grid, lat_grid = np.meshgrid(lons, lats)
