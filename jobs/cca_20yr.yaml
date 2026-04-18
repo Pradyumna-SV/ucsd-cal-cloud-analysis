@@ -32,7 +32,7 @@ spec:
         command: ["/bin/bash", "-c"]
         args:
           - |
-            set -e
+            set -eo pipefail
 
             apt-get update -q && apt-get install -y -q git
 
