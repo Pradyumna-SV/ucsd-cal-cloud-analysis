@@ -236,7 +236,13 @@ def load_day(year, month, day):
         return None
 
     rows, idx = [], 0
+    _printed_sample = getattr(load_day, "_printed_sample", False)
     for ts in sorted(meta.keys()):
+        if not _printed_sample:
+            sample_keys = list(meta.keys())[:5]
+            print(f"  [debug] sample JSON keys from {prefix}: {sample_keys}")
+            load_day._printed_sample = True
+            _printed_sample = True
         t = parse_modis_ts(ts)
         for lat, lon in meta[ts]:
             rows.append({"lat": float(lat), "lon": float(lon), "time": t})
