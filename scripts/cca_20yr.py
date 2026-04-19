@@ -115,7 +115,10 @@ def _match_var(ds, tree, df, varname, level=None):
 
     date_strs = np.array([f"{y:04d}-{m:02d}-{d:02d}" for y, m, d in zip(yr, mo, dy)])
 
-    for date_str in np.unique(date_strs):
+    unique_dates = np.unique(date_strs)
+    n_ok, n_fail = 0, 0
+    first_err = None
+    for date_str in unique_dates:
         in_date  = date_strs == date_str
         row_idxs = valid_idx[in_date]
         try:
@@ -126,8 +129,15 @@ def _match_var(ds, tree, df, varname, level=None):
                 ti = day_times.get_indexer([times.iloc[i]], method="nearest")[0]
                 if ti >= 0:
                     out[i] = float(flat[ti, sp_idx[i]])
-        except Exception:
-            pass   # missing day in ERA5 — leave NaN
+            n_ok += 1
+        except Exception as e:
+            n_fail += 1
+            if first_err is None:
+                first_err = f"{date_str}: {type(e).__name__}: {e}"
+    print(f"  [{varname}] days OK={n_ok} FAIL={n_fail}  "
+          f"valid_ts={len(valid_idx)}  matched={np.isfinite(out).sum()}")
+    if first_err:
+        print(f"  [{varname}] first failure: {first_err}")
     return out
 
 
