@@ -95,18 +95,31 @@ def _match_var(ds, tree, df, varname, level=None):
     if level is not None:
         da = da.sel(level=level)
 
-    # Filter to valid (non-NaT) timestamps only before calling .dt.date
+    # Filter to valid (non-NaT) timestamps only.
+    # Avoid .dt.date — it goes through Python datetime which rejects year 0.
+    # Use .dt.year/.dt.month/.dt.day (pure pandas int arithmetic) instead.
     valid_mask = times.notna()
     if not valid_mask.any():
         return out
     valid_idx   = np.where(valid_mask)[0]
     valid_times = times.iloc[valid_idx]
 
-    for date in np.unique(valid_times.dt.date):
-        in_date  = valid_times.dt.date == date
-        row_idxs = valid_idx[in_date.values]
+    yr  = valid_times.dt.year.values
+    mo  = valid_times.dt.month.values
+    dy  = valid_times.dt.day.values
+    # Additional guard: keep only dates in the plausible MODIS era (2000-2023)
+    era_mask  = (yr >= 2000) & (yr <= 2023)
+    valid_idx = valid_idx[era_mask]
+    yr, mo, dy = yr[era_mask], mo[era_mask], dy[era_mask]
+    valid_times = times.iloc[valid_idx]
+
+    date_strs = np.array([f"{y:04d}-{m:02d}-{d:02d}" for y, m, d in zip(yr, mo, dy)])
+
+    for date_str in np.unique(date_strs):
+        in_date  = date_strs == date_str
+        row_idxs = valid_idx[in_date]
         try:
-            day_da    = da.sel(time=str(date)).load()
+            day_da    = da.sel(time=date_str).load()
             day_times = pd.DatetimeIndex(day_da["time"].values)
             flat      = day_da.values.reshape(len(day_times), -1)
             for i in row_idxs:
