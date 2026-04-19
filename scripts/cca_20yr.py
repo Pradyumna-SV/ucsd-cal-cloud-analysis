@@ -24,7 +24,9 @@ Environment variables (all have defaults):
 
 import json
 import os
+import re
 import warnings
+from datetime import datetime
 from pathlib import Path
 
 import gcsfs
@@ -66,6 +68,32 @@ N_WALK_STEPS = 9
 WALK_SIGMA   = 1.5
 
 os.makedirs(OUT_DIR, exist_ok=True)
+
+# ── MODIS timestamp parsing ─────────────────────────────────────────────────
+# JSON keys in centers files are MODIS granule names like:
+#   "MOD35_L2.A2002362.1005.061.2017321034257.hdf"
+# Pattern: .A{YYYY}{DOY}.{HHMM}
+_MODIS_RE = re.compile(r'\.A(\d{7})\.(\d{4})')
+
+def parse_modis_ts(key: str) -> pd.Timestamp:
+    """Parse a MODIS granule name / JSON key into a pandas Timestamp.
+    Falls back to pd.to_datetime for ISO-formatted keys."""
+    m = _MODIS_RE.search(key)
+    if m:
+        year_doy, hhmm = m.group(1), m.group(2)
+        year = int(year_doy[:4])
+        doy  = int(year_doy[4:])
+        hh, mm = int(hhmm[:2]), int(hhmm[2:])
+        try:
+            return (pd.Timestamp(datetime(year, 1, 1))
+                    + pd.Timedelta(days=doy - 1, hours=hh, minutes=mm))
+        except Exception:
+            return pd.NaT
+    # fallback for ISO strings
+    try:
+        return pd.Timestamp(key)
+    except Exception:
+        return pd.NaT
 
 
 # ── ERA5 setup ─────────────────────────────────────────────────────────────
@@ -209,10 +237,7 @@ def load_day(year, month, day):
 
     rows, idx = [], 0
     for ts in sorted(meta.keys()):
-        try:
-            t = pd.Timestamp(ts)
-        except Exception:
-            t = pd.NaT
+        t = parse_modis_ts(ts)
         for lat, lon in meta[ts]:
             rows.append({"lat": float(lat), "lon": float(lon), "time": t})
             idx += 1
