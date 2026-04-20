@@ -323,8 +323,15 @@ def decoded_walk(pipe, var_vals, tag, phys_label, out_path):
     print(f"  VAE loaded on {device}")
 
     mean_z   = pipe["X_raw"].mean(axis=0)
-    phys_dir = pipe["physics_dir"]
-    spread   = np.std(pipe["physics_scores"])
+
+    # Convert direction from standardised X_sc space back to raw embedding space
+    # (phys_dir was computed in the space where each feature has unit variance)
+    sx       = pipe["scaler_X"]
+    raw_dir  = pipe["physics_dir"] * sx.scale_
+    raw_dir /= np.linalg.norm(raw_dir)
+
+    # Spread = std of raw embeddings projected onto the direction
+    spread = np.std(pipe["X_raw"] @ raw_dir)
 
     alphas = np.linspace(-WALK_SIGMA, WALK_SIGMA, N_WALK_STEPS) * spread
     # Bin var_vals by physics score to get expected label at each walk step
@@ -333,14 +340,17 @@ def decoded_walk(pipe, var_vals, tag, phys_label, out_path):
                             np.sort(pipe["physics_scores"]),
                             np.sort(var_vals[np.isfinite(var_vals)]))
 
-    imgs = []
+    raw_imgs = []
     with torch.no_grad():
         for alpha in alphas:
-            z   = torch.tensor(mean_z + alpha * phys_dir, dtype=torch.float32).unsqueeze(0).to(device)
+            z   = torch.tensor(mean_z + alpha * raw_dir, dtype=torch.float32).unsqueeze(0).to(device)
             out = model.decoder(z).squeeze(0).cpu().numpy()   # (3, H, W)
-            grey = np.mean(out, axis=0)
-            lo, hi = np.percentile(grey, [2, 98])
-            imgs.append(np.clip((grey - lo) / (hi - lo + 1e-8), 0, 1))
+            raw_imgs.append(np.mean(out, axis=0))             # greyscale mean across channels
+
+    # Global contrast stretch across all walk steps so brightness changes are visible
+    all_vals = np.concatenate([img.ravel() for img in raw_imgs])
+    lo, hi   = np.percentile(all_vals, [2, 98])
+    imgs = [np.clip((img - lo) / (hi - lo + 1e-8), 0, 1) for img in raw_imgs]
 
     fig, axes = plt.subplots(1, N_WALK_STEPS,
                              figsize=(N_WALK_STEPS * 2.4, 2.8),
