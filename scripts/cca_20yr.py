@@ -309,7 +309,94 @@ def run_cca(X, target, lat, months, n_pca, tag=""):
                 physics_scores=Xc_all.flatten())
 
 
-# ── Decoded walk ────────────────────────────────────────────────────────────
+# ── Bin-composite walk ───────────────────────────────────────────────────────
+def bin_composite_walk(X_vae, var_vals, lat, months, tag, phys_label, out_path,
+                       n_bins=9, batch_size=256):
+    """
+    Bin-composite decoded walk — the only approach that reliably shows visual
+    signal when CCA r is modest.
+
+    Strategy
+    --------
+    1. Deconfound *var_vals* (SST or EIS) by (lat, lat², sin/cos month).
+       This residual is used only for binning so lat/season don't dominate.
+    2. Divide tiles into quantile bins by the residual.
+    3. Decode the *original* (on-manifold) VAE embeddings for every tile in
+       each bin, then average those decoded images.
+       Averaging ~N/n_bins real tiles cancels decoder noise and reveals any
+       systematic visual pattern without ever leaving the trained manifold.
+    4. Label each panel with the actual (non-residual) median of var_vals.
+    """
+    import torch
+    import sys
+    sys.path.insert(0, str(Path(__file__).parent))
+    from vae import VAELightningModule
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    model  = VAELightningModule.load_from_checkpoint(CHECKPOINT)
+    model.to(device).eval()
+    print(f"  VAE loaded on {device}")
+
+    valid = np.isfinite(var_vals)
+    X_v   = X_vae[valid].astype("float32")
+    y_v   = var_vals[valid]
+    lat_v = lat[valid]
+    mon_v = months[valid]
+    print(f"  [{phys_label}] {valid.sum():,} valid tiles for composite walk")
+
+    # Deconfound var_vals for binning only; decode original embeddings.
+    C = np.column_stack([lat_v, lat_v**2,
+                         np.sin(2 * np.pi * mon_v / 12),
+                         np.cos(2 * np.pi * mon_v / 12)])
+    y_res = y_v - LinearRegression(fit_intercept=True).fit(C, y_v).predict(C)
+
+    edges = np.percentile(y_res, np.linspace(0, 100, n_bins + 1))
+    edges[0] -= 1e-6; edges[-1] += 1e-6
+
+    composite_imgs, bin_medians, bin_ns = [], [], []
+    for i in range(n_bins):
+        mask  = (y_res >= edges[i]) & (y_res < edges[i + 1])
+        X_bin = X_v[mask]
+        decoded = []
+        with torch.no_grad():
+            for start in range(0, len(X_bin), batch_size):
+                z   = torch.tensor(X_bin[start:start + batch_size],
+                                   dtype=torch.float32).to(device)
+                out = model.decoder(z).cpu().numpy()  # (B, 3, H, W)
+                decoded.append(np.mean(out, axis=1))   # greyscale: (B, H, W)
+        composite = np.mean(np.concatenate(decoded, axis=0), axis=0)
+        composite_imgs.append(composite)
+        bin_medians.append(float(np.median(y_v[mask])))
+        bin_ns.append(int(mask.sum()))
+        print(f"  bin {i+1}/{n_bins}: n={bin_ns[-1]:,}  median={bin_medians[-1]:.2f}")
+
+    all_vals = np.concatenate([img.ravel() for img in composite_imgs])
+    lo, hi   = np.percentile(all_vals, [2, 98])
+    imgs = [np.clip((img - lo) / (hi - lo + 1e-8), 0, 1) for img in composite_imgs]
+
+    fig, axes = plt.subplots(1, n_bins,
+                             figsize=(n_bins * 2.4, 3.4),
+                             facecolor="#1a1a1a")
+    fig.suptitle(
+        f"VAE bin-composite walk — {phys_label}  {tag}\n"
+        f"(each panel = mean of n decoded tiles; binned by lat/season-deconfounded residual)",
+        color="white", fontsize=9, fontweight="bold")
+    for col, (img, med, n) in enumerate(zip(imgs, bin_medians, bin_ns)):
+        ax = axes[col]
+        ax.imshow(img, cmap="bone", vmin=0, vmax=1)
+        ax.set_xticks([]); ax.set_yticks([])
+        for sp in ax.spines.values():
+            sp.set_edgecolor("#555")
+        ax.set_title(f"{med:.1f}", color="white", fontsize=9, fontweight="bold", pad=3)
+        ax.set_xlabel(f"n={n:,}", color="#aaa", fontsize=7)
+
+    plt.tight_layout(rect=[0, 0.04, 1, 0.84])
+    plt.savefig(out_path, dpi=150, bbox_inches="tight", facecolor="#1a1a1a")
+    print(f"  Saved -> {out_path}")
+    plt.close()
+
+
+# ── Decoded walk (CCA direction — kept for reference) ────────────────────────
 def decoded_walk(pipe, var_vals, tag, phys_label, out_path):
     """Walk the VAE decoder along the CCA direction. Requires VAE checkpoint."""
     import torch
@@ -452,28 +539,32 @@ def main():
         pipe_vae_eis = run_cca(X_vae_oc, eis, lat_oc, mon_oc, N_PCA_VAE, tag="VAE-EIS")
         results.append(("VAE", "EIS", pipe_vae_eis["r_pearson"], pipe_vae_eis["r_spearman"]))
 
-    # 5. Decoded walks (needs checkpoint)
+    # 5. Bin-composite walks (needs checkpoint)
     has_ckpt = os.path.exists(CHECKPOINT)
     if not has_ckpt:
         print(f"\nCheckpoint not found at {CHECKPOINT} — skipping decoded walks.")
         print("To enable: copy lightning_model_50_transform.pt to that path.")
     else:
-        print("\nDecoding VAE walk along SST direction...")
-        decoded_walk(
-            pipe        = pipe_vae_sst,
-            var_vals    = sst_oc,
-            tag         = "(20-year Pelican, unblinded)",
-            phys_label  = "SST (°C)",
-            out_path    = os.path.join(OUT_DIR, "walk_vae_sst.png"),
+        print("\nBin-composite VAE walk — SST...")
+        bin_composite_walk(
+            X_vae      = X_vae_oc,
+            var_vals   = sst_oc,
+            lat        = lat_oc,
+            months     = mon_oc,
+            tag        = "(20-year Pelican, unblinded)",
+            phys_label = "SST (°C)",
+            out_path   = os.path.join(OUT_DIR, "walk_composite_sst.png"),
         )
-        if eis is not None and pipe_vae_eis["r_pearson"] > 0.10:
-            print("Decoding VAE walk along EIS direction...")
-            decoded_walk(
-                pipe        = pipe_vae_eis,
-                var_vals    = eis[np.isfinite(eis)],
-                tag         = "(20-year Pelican, unblinded)",
-                phys_label  = "EIS (K)",
-                out_path    = os.path.join(OUT_DIR, "walk_vae_eis.png"),
+        if eis is not None:
+            print("\nBin-composite VAE walk — EIS...")
+            bin_composite_walk(
+                X_vae      = X_vae_oc,
+                var_vals   = eis,
+                lat        = lat_oc,
+                months     = mon_oc,
+                tag        = "(20-year Pelican, unblinded)",
+                phys_label = "EIS (K)",
+                out_path   = os.path.join(OUT_DIR, "walk_composite_eis.png"),
             )
 
     # 6. Save r values
