@@ -472,17 +472,17 @@ def bin_mosaic_walk(X_vae, var_vals, lat, months, tag, phys_label, out_path,
 
 
 # ── PCA-component composite walk ─────────────────────────────────────────────
-def pca_component_walk(X_vae, eis_vals, lat, months, tag, out_path,
+def pca_component_walk(X_vae, target_vals, lat, months, tag, phys_label, out_path,
                        n_components=3, n_bins=9, batch_size=256):
     """
     Walk along the top-n_components PCA directions of the deconfounded VAE
     embedding space.  Each row is one PC; panels are composites of tiles
     binned by their score on that PC.  Each row is labelled with variance
-    explained and Pearson r vs deconfounded EIS — revealing which structural
-    mode of the VAE correlates with stability.
+    explained and Pearson r vs the deconfounded target — revealing which
+    structural mode of the VAE correlates with the physical variable.
 
     CCA(n_components=1) captures the single direction maximally correlated
-    with scalar EIS.  Additional EIS-linked variance may live in PC2/PC3
+    with a scalar target.  Additional variance may live in PC2/PC3
     that CCA can't expose when Y is 1-D.
     """
     import torch
@@ -495,9 +495,9 @@ def pca_component_walk(X_vae, eis_vals, lat, months, tag, out_path,
     model.to(device).eval()
     print(f"  VAE loaded on {device}")
 
-    valid   = np.isfinite(eis_vals)
+    valid   = np.isfinite(target_vals)
     X_v     = X_vae[valid].astype("float32")
-    y_v     = eis_vals[valid]
+    y_v     = target_vals[valid]
     lat_v   = lat[valid]
     mon_v   = months[valid]
 
@@ -517,7 +517,7 @@ def pca_component_walk(X_vae, eis_vals, lat, months, tag, out_path,
                              figsize=(n_bins * 2.4, n_components * 2.8),
                              facecolor="#1a1a1a")
     fig.suptitle(
-        f"PCA-component composite walk — EIS  {tag}\n"
+        f"PCA-component composite walk — {phys_label}  {tag}\n"
         f"(each row = top-K PCA direction of deconfounded VAE space; "
         f"composites binned by PC score)",
         color="white", fontsize=9, fontweight="bold")
@@ -528,7 +528,7 @@ def pca_component_walk(X_vae, eis_vals, lat, months, tag, out_path,
         edges[0] -= 1e-6; edges[-1] += 1e-6
 
         var_pct  = pca.explained_variance_ratio_[k] * 100
-        row_label = f"PC{k+1}  {var_pct:.1f}% var  r_EIS={pc_r[k]:.3f}"
+        row_label = f"PC{k+1}  {var_pct:.1f}% var  r_{phys_label.split()[0]}={pc_r[k]:.3f}"
         print(f"  {row_label}")
 
         row_composites = []
@@ -724,6 +724,26 @@ def main():
             phys_label = "SST (°C)",
             out_path   = os.path.join(OUT_DIR, "walk_composite_sst.png"),
         )
+        print("\nBin-mosaic VAE walk — SST...")
+        bin_mosaic_walk(
+            X_vae      = X_vae_oc,
+            var_vals   = sst_oc,
+            lat        = lat_oc,
+            months     = mon_oc,
+            tag        = "(20-year Pelican, unblinded)",
+            phys_label = "SST (°C)",
+            out_path   = os.path.join(OUT_DIR, "walk_mosaic_sst.png"),
+        )
+        print("\nPCA-component walk — SST...")
+        pca_component_walk(
+            X_vae        = X_vae_oc,
+            target_vals  = sst_oc,
+            lat          = lat_oc,
+            months       = mon_oc,
+            tag          = "(20-year Pelican, unblinded)",
+            phys_label   = "SST (°C)",
+            out_path     = os.path.join(OUT_DIR, "walk_pca_sst.png"),
+        )
         if eis is not None:
             print("\nBin-composite VAE walk — EIS...")
             bin_composite_walk(
@@ -747,12 +767,13 @@ def main():
             )
             print("\nPCA-component walk — EIS...")
             pca_component_walk(
-                X_vae      = X_vae_oc,
-                eis_vals   = eis,
-                lat        = lat_oc,
-                months     = mon_oc,
-                tag        = "(20-year Pelican, unblinded)",
-                out_path   = os.path.join(OUT_DIR, "walk_pca_eis.png"),
+                X_vae       = X_vae_oc,
+                target_vals = eis,
+                lat         = lat_oc,
+                months      = mon_oc,
+                tag         = "(20-year Pelican, unblinded)",
+                phys_label  = "EIS (K)",
+                out_path    = os.path.join(OUT_DIR, "walk_pca_eis.png"),
             )
 
     # 6. Save r values
