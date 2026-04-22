@@ -396,6 +396,175 @@ def bin_composite_walk(X_vae, var_vals, lat, months, tag, phys_label, out_path,
     plt.close()
 
 
+# ── Bin-mosaic walk ──────────────────────────────────────────────────────────
+def bin_mosaic_walk(X_vae, var_vals, lat, months, tag, phys_label, out_path,
+                    n_bins=9, n_samples=3, seed=42):
+    """
+    Same binning as bin_composite_walk but shows n_samples individual decoded
+    tiles per bin instead of their mean.  Averaging destroys cloud texture;
+    individual tiles show what the VAE actually learned.
+    """
+    import torch
+    import sys
+    sys.path.insert(0, str(Path(__file__).parent))
+    from vae import VAELightningModule
+
+    rng    = np.random.default_rng(seed)
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    model  = VAELightningModule.load_from_checkpoint(CHECKPOINT)
+    model.to(device).eval()
+    print(f"  VAE loaded on {device}")
+
+    valid = np.isfinite(var_vals)
+    X_v   = X_vae[valid].astype("float32")
+    y_v   = var_vals[valid]
+    lat_v = lat[valid]
+    mon_v = months[valid]
+    print(f"  [{phys_label}] {valid.sum():,} valid tiles for mosaic walk")
+
+    C     = np.column_stack([lat_v, lat_v**2,
+                             np.sin(2 * np.pi * mon_v / 12),
+                             np.cos(2 * np.pi * mon_v / 12)])
+    y_res = y_v - LinearRegression(fit_intercept=True).fit(C, y_v).predict(C)
+
+    edges = np.percentile(y_res, np.linspace(0, 100, n_bins + 1))
+    edges[0] -= 1e-6; edges[-1] += 1e-6
+
+    all_tiles, bin_medians, bin_ns = [], [], []
+    for i in range(n_bins):
+        mask  = (y_res >= edges[i]) & (y_res < edges[i + 1])
+        X_bin = X_v[mask]
+        k     = min(n_samples, len(X_bin))
+        idx   = rng.choice(len(X_bin), size=k, replace=False)
+        with torch.no_grad():
+            z   = torch.tensor(X_bin[idx], dtype=torch.float32).to(device)
+            out = model.decoder(z).cpu().numpy()          # (k, 3, H, W) in [-1, 1]
+        tiles = np.clip((out + 1) / 2, 0, 1).transpose(0, 2, 3, 1)   # (k, H, W, 3)
+        all_tiles.append(tiles)
+        bin_medians.append(float(np.median(y_v[mask])))
+        bin_ns.append(int(mask.sum()))
+        print(f"  bin {i+1}/{n_bins}: n={bin_ns[-1]:,}  median={bin_medians[-1]:.2f}")
+
+    fig, axes = plt.subplots(n_samples, n_bins,
+                             figsize=(n_bins * 2.4, n_samples * 2.5),
+                             facecolor="#1a1a1a")
+    fig.suptitle(
+        f"VAE bin-mosaic walk — {phys_label}  {tag}\n"
+        f"(each panel = individual decoded tile; binned by lat/season-deconfounded residual)",
+        color="white", fontsize=9, fontweight="bold")
+    for col in range(n_bins):
+        for row in range(n_samples):
+            ax = axes[row, col]
+            ax.imshow(all_tiles[col][row])
+            ax.set_xticks([]); ax.set_yticks([])
+            for sp in ax.spines.values():
+                sp.set_edgecolor("#555")
+            if row == 0:
+                ax.set_title(f"{bin_medians[col]:.1f}", color="white",
+                             fontsize=9, fontweight="bold", pad=3)
+            if row == n_samples - 1:
+                ax.set_xlabel(f"n={bin_ns[col]:,}", color="#aaa", fontsize=7)
+
+    plt.tight_layout(rect=[0, 0.03, 1, 0.87])
+    plt.savefig(out_path, dpi=150, bbox_inches="tight", facecolor="#1a1a1a")
+    print(f"  Saved -> {out_path}")
+    plt.close()
+
+
+# ── PCA-component composite walk ─────────────────────────────────────────────
+def pca_component_walk(X_vae, eis_vals, lat, months, tag, out_path,
+                       n_components=3, n_bins=9, batch_size=256):
+    """
+    Walk along the top-n_components PCA directions of the deconfounded VAE
+    embedding space.  Each row is one PC; panels are composites of tiles
+    binned by their score on that PC.  Each row is labelled with variance
+    explained and Pearson r vs deconfounded EIS — revealing which structural
+    mode of the VAE correlates with stability.
+
+    CCA(n_components=1) captures the single direction maximally correlated
+    with scalar EIS.  Additional EIS-linked variance may live in PC2/PC3
+    that CCA can't expose when Y is 1-D.
+    """
+    import torch
+    import sys
+    sys.path.insert(0, str(Path(__file__).parent))
+    from vae import VAELightningModule
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    model  = VAELightningModule.load_from_checkpoint(CHECKPOINT)
+    model.to(device).eval()
+    print(f"  VAE loaded on {device}")
+
+    valid   = np.isfinite(eis_vals)
+    X_v     = X_vae[valid].astype("float32")
+    y_v     = eis_vals[valid]
+    lat_v   = lat[valid]
+    mon_v   = months[valid]
+
+    C       = np.column_stack([lat_v, lat_v**2,
+                               np.sin(2 * np.pi * mon_v / 12),
+                               np.cos(2 * np.pi * mon_v / 12)])
+    X_deconf = X_v - LinearRegression(fit_intercept=True).fit(C, X_v).predict(C)
+    y_res    = y_v - LinearRegression(fit_intercept=True).fit(C, y_v).predict(C)
+
+    X_sc    = StandardScaler().fit_transform(X_deconf)
+    pca     = PCA(n_components=n_components, random_state=42)
+    X_pca   = pca.fit_transform(X_sc)          # (N, n_components)
+
+    pc_r    = [pearsonr(X_pca[:, k], y_res)[0] for k in range(n_components)]
+
+    fig, axes = plt.subplots(n_components, n_bins,
+                             figsize=(n_bins * 2.4, n_components * 2.8),
+                             facecolor="#1a1a1a")
+    fig.suptitle(
+        f"PCA-component composite walk — EIS  {tag}\n"
+        f"(each row = top-K PCA direction of deconfounded VAE space; "
+        f"composites binned by PC score)",
+        color="white", fontsize=9, fontweight="bold")
+
+    for k in range(n_components):
+        scores = X_pca[:, k]
+        edges  = np.percentile(scores, np.linspace(0, 100, n_bins + 1))
+        edges[0] -= 1e-6; edges[-1] += 1e-6
+
+        var_pct  = pca.explained_variance_ratio_[k] * 100
+        row_label = f"PC{k+1}  {var_pct:.1f}% var  r_EIS={pc_r[k]:.3f}"
+        print(f"  {row_label}")
+
+        row_composites = []
+        for i in range(n_bins):
+            mask   = (scores >= edges[i]) & (scores < edges[i + 1])
+            X_bin  = X_v[mask]
+            decoded = []
+            with torch.no_grad():
+                for start in range(0, len(X_bin), batch_size):
+                    z   = torch.tensor(X_bin[start:start + batch_size],
+                                       dtype=torch.float32).to(device)
+                    out = model.decoder(z).cpu().numpy()
+                    decoded.append(np.mean(out, axis=1))
+            row_composites.append(np.mean(np.concatenate(decoded, axis=0), axis=0))
+
+        all_vals = np.concatenate([c.ravel() for c in row_composites])
+        lo, hi   = np.percentile(all_vals, [2, 98])
+        for i, composite in enumerate(row_composites):
+            img = np.clip((composite - lo) / (hi - lo + 1e-8), 0, 1)
+            ax  = axes[k, i]
+            ax.imshow(img, cmap="bone", vmin=0, vmax=1)
+            ax.set_xticks([]); ax.set_yticks([])
+            for sp in ax.spines.values():
+                sp.set_edgecolor("#555")
+            if i == 0:
+                ax.set_ylabel(row_label, color="white", fontsize=7,
+                              rotation=90, labelpad=4)
+            if k == 0:
+                ax.set_title(f"bin {i+1}", color="#aaa", fontsize=8, pad=3)
+
+    plt.tight_layout(rect=[0, 0.02, 1, 0.91])
+    plt.savefig(out_path, dpi=150, bbox_inches="tight", facecolor="#1a1a1a")
+    print(f"  Saved -> {out_path}")
+    plt.close()
+
+
 # ── Decoded walk (CCA direction — kept for reference) ────────────────────────
 def decoded_walk(pipe, var_vals, tag, phys_label, out_path):
     """Walk the VAE decoder along the CCA direction. Requires VAE checkpoint."""
@@ -565,6 +734,25 @@ def main():
                 tag        = "(20-year Pelican, unblinded)",
                 phys_label = "EIS (K)",
                 out_path   = os.path.join(OUT_DIR, "walk_composite_eis.png"),
+            )
+            print("\nBin-mosaic VAE walk — EIS...")
+            bin_mosaic_walk(
+                X_vae      = X_vae_oc,
+                var_vals   = eis,
+                lat        = lat_oc,
+                months     = mon_oc,
+                tag        = "(20-year Pelican, unblinded)",
+                phys_label = "EIS (K)",
+                out_path   = os.path.join(OUT_DIR, "walk_mosaic_eis.png"),
+            )
+            print("\nPCA-component walk — EIS...")
+            pca_component_walk(
+                X_vae      = X_vae_oc,
+                eis_vals   = eis,
+                lat        = lat_oc,
+                months     = mon_oc,
+                tag        = "(20-year Pelican, unblinded)",
+                out_path   = os.path.join(OUT_DIR, "walk_pca_eis.png"),
             )
 
     # 6. Save r values
