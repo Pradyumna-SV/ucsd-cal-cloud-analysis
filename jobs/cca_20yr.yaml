@@ -47,7 +47,7 @@ spec:
         - name: WANDB_API_KEY
           valueFrom:
             secretKeyRef:
-              name: wandb-secret
+              name: wandb-secret-prad-ccacloud
               key: api-key
 
         command: ["/bin/bash", "-c"]
