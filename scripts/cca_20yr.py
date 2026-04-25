@@ -29,6 +29,7 @@ import warnings
 from datetime import datetime
 from pathlib import Path
 
+import wandb
 import gcsfs
 import matplotlib
 import numpy as np
@@ -56,16 +57,23 @@ MANIFEST      = os.environ.get("MANIFEST",      "/workspace/repo/manifest.csv")
 STREAM_STRIDE = int(os.environ.get("STREAM_STRIDE", 11))
 MAX_PER_DAY   = int(os.environ.get("MAX_PER_DAY",   200))
 
+# Analysis hyperparameters — all overridable via env vars.
+N_PCA_VAE       = int(os.environ.get("N_PCA_VAE",       50))
+N_PCA_T2V       = int(os.environ.get("N_PCA_T2V",       49))
+CCA_N_COMPONENTS = int(os.environ.get("CCA_N_COMPONENTS", 1))
+N_WALK_STEPS    = int(os.environ.get("N_WALK_STEPS",     9))
+WALK_SIGMA      = float(os.environ.get("WALK_SIGMA",     1.5))
+APPLY_CLAHE     = os.environ.get("APPLY_CLAHE", "0").strip().lower() in ("1", "true", "yes")
+
+# W&B
+WANDB_PROJECT  = os.environ.get("WANDB_PROJECT",  "ucsd-cal-cloud-cca")
+WANDB_RUN_NAME = os.environ.get("WANDB_RUN_NAME", None)   # auto-generated if not set
+
 # ARCO-ERA5 on Google Cloud Storage — public, no auth needed.
 # Contains: sea_surface_temperature, temperature (pressure levels),
 #           specific_humidity, geopotential, vertical_velocity,
 #           total_column_water_vapour, 2m_temperature
 ARCO_ERA5 = "gs://gcp-public-data-arco-era5/ar/full_37-1h-0p25deg-chunk-1.zarr-v3"
-
-N_PCA_VAE    = 50
-N_PCA_T2V    = 49
-N_WALK_STEPS = 9
-WALK_SIGMA   = 1.5
 
 os.makedirs(OUT_DIR, exist_ok=True)
 
@@ -292,7 +300,7 @@ def run_cca(X, target, lat, months, n_pca, tag=""):
     print(f"  [{tag}] PCA({n_pca_act}): {pca.explained_variance_ratio_.sum()*100:.1f}% variance retained")
 
     X_tr, X_te, Y_tr, Y_te = train_test_split(X_pca, Y_sc, test_size=0.2, random_state=42)
-    cca = CCA(n_components=1, max_iter=1000).fit(X_tr, Y_tr)
+    cca = CCA(n_components=CCA_N_COMPONENTS, max_iter=1000).fit(X_tr, Y_tr)
     Xc, Yc = cca.transform(X_te, Y_te)
     pr, _  = pearsonr(Xc.flatten(), Yc.flatten())
     sr, _  = spearmanr(Xc.flatten(), Yc.flatten())
@@ -629,6 +637,22 @@ def decoded_walk(pipe, var_vals, tag, phys_label, out_path):
 
 # ── Main ────────────────────────────────────────────────────────────────────
 def main():
+    wandb.init(
+        project=WANDB_PROJECT,
+        name=WANDB_RUN_NAME,
+        config=dict(
+            stream_stride=STREAM_STRIDE,
+            max_per_day=MAX_PER_DAY,
+            n_pca_vae=N_PCA_VAE,
+            n_pca_t2v=N_PCA_T2V,
+            cca_n_components=CCA_N_COMPONENTS,
+            n_walk_steps=N_WALK_STEPS,
+            walk_sigma=WALK_SIGMA,
+            apply_clahe=APPLY_CLAHE,
+            checkpoint=os.path.basename(CHECKPOINT),
+        ),
+    )
+
     # 1. Load manifest and sample days
     print("Loading manifest...")
     manifest = pd.read_csv(MANIFEST)
@@ -788,6 +812,32 @@ def main():
         for emb, tgt, pr, sr in results:
             f.write(f"{emb:<8} {tgt:<6} {pr:>10.4f} {sr:>13.4f}\n")
     print(f"\nResults saved -> {results_path}")
+
+    # 7. Log to W&B
+    wandb_metrics = {
+        "n_days":        n_loaded,
+        "n_ocean_tiles": len(df_ocean),
+        "T2V_SST_pearson_r":  pipe_t2v["r_pearson"],
+        "T2V_SST_spearman_r": pipe_t2v["r_spearman"],
+        "VAE_SST_pearson_r":  pipe_vae_sst["r_pearson"],
+        "VAE_SST_spearman_r": pipe_vae_sst["r_spearman"],
+    }
+    if eis is not None:
+        wandb_metrics["VAE_EIS_pearson_r"]  = pipe_vae_eis["r_pearson"]
+        wandb_metrics["VAE_EIS_spearman_r"] = pipe_vae_eis["r_spearman"]
+
+    png_keys = [
+        "walk_composite_sst", "walk_mosaic_sst", "walk_pca_sst",
+        "walk_composite_eis", "walk_mosaic_eis", "walk_pca_eis",
+    ]
+    for key in png_keys:
+        p = os.path.join(OUT_DIR, f"{key}.png")
+        if os.path.exists(p):
+            wandb_metrics[key] = wandb.Image(p)
+
+    wandb.log(wandb_metrics)
+    wandb.save(results_path)
+    wandb.finish()
 
     print("\nDone.")
 

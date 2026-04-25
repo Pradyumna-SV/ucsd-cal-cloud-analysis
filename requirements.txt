@@ -7,3 +7,4 @@ zarr
 gcsfs
 pytorch-lightning
 matplotlib
+wandb

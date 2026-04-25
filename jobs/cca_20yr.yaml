@@ -28,6 +28,27 @@ spec:
           value: "11"
         - name: MAX_PER_DAY
           value: "200"
+        - name: N_PCA_VAE
+          value: "50"
+        - name: N_PCA_T2V
+          value: "49"
+        - name: CCA_N_COMPONENTS
+          value: "1"
+        - name: N_WALK_STEPS
+          value: "9"
+        - name: WALK_SIGMA
+          value: "1.5"
+        - name: APPLY_CLAHE
+          value: "0"
+        - name: WANDB_PROJECT
+          value: "ucsd-cal-cloud-cca"
+        - name: WANDB_RUN_NAME
+          value: "baseline-cca1-sst-eis"
+        - name: WANDB_API_KEY
+          valueFrom:
+            secretKeyRef:
+              name: wandb-secret
+              key: api-key
 
         command: ["/bin/bash", "-c"]
         args:
@@ -48,7 +69,8 @@ spec:
               numpy pandas scipy scikit-learn \
               xarray zarr gcsfs \
               pytorch-lightning \
-              matplotlib
+              matplotlib \
+              wandb
 
             mkdir -p /workspace/results/cca_20yr
             mkdir -p /workspace/logs
