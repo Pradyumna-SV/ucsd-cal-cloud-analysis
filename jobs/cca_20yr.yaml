@@ -33,7 +33,7 @@ spec:
         - name: N_PCA_T2V
           value: "49"
         - name: CCA_N_COMPONENTS
-          value: "1"
+          value: "3"
         - name: N_WALK_STEPS
           value: "9"
         - name: WALK_SIGMA
@@ -43,7 +43,7 @@ spec:
         - name: WANDB_PROJECT
           value: "ucsd-cal-cloud-cca"
         - name: WANDB_RUN_NAME
-          value: "baseline-cca1-sst-eis"
+          value: "multi-cca3-eis-sst-omega500"
         - name: WANDB_API_KEY
           valueFrom:
             secretKeyRef:

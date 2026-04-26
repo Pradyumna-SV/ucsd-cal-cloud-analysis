@@ -213,6 +213,11 @@ def match_eis(ds, tree, df):
     return lts - gm_km * (z700_km - z_lcl)
 
 
+def match_omega500(ds, tree, df):
+    """Vertical velocity omega (Pa/s) at 500 hPa. Negative=ascent, positive=subsidence."""
+    return _match_var(ds, tree, df, "vertical_velocity", level=500)
+
+
 # ── Local embedding loader ──────────────────────────────────────────────────
 def load_day(year, month, day):
     """
@@ -300,7 +305,7 @@ def run_cca(X, target, lat, months, n_pca, tag=""):
     print(f"  [{tag}] PCA({n_pca_act}): {pca.explained_variance_ratio_.sum()*100:.1f}% variance retained")
 
     X_tr, X_te, Y_tr, Y_te = train_test_split(X_pca, Y_sc, test_size=0.2, random_state=42)
-    cca = CCA(n_components=CCA_N_COMPONENTS, max_iter=1000).fit(X_tr, Y_tr)
+    cca = CCA(n_components=1, max_iter=1000).fit(X_tr, Y_tr)
     Xc, Yc = cca.transform(X_te, Y_te)
     pr, _  = pearsonr(Xc.flatten(), Yc.flatten())
     sr, _  = spearmanr(Xc.flatten(), Yc.flatten())
@@ -315,6 +320,81 @@ def run_cca(X, target, lat, months, n_pca, tag=""):
                 physics_dir=phys_dir, scaler_X=sx,
                 X_deconf=X_deconf, X_raw=X,
                 physics_scores=Xc_all.flatten())
+
+
+# ── Multivariate CCA pipeline ───────────────────────────────────────────────
+def run_cca_multi(X, Y_matrix, target_names, lat, months, n_pca, tag=""):
+    """
+    Deconfound X and each Y column by (lat, lat², sin/cos month), then run
+    CCA(n_components = min(CCA_N_COMPONENTS, n_targets)).
+
+    Returns one canonical direction per component, canonical scores for the
+    full dataset, and Pearson/Spearman r for each canonical pair on the 20%
+    held-out test set.
+
+    Also returns valid_mask so the caller can filter X_vae to matching rows
+    before passing it to cca_component_walk.
+    """
+    valid = np.all(np.isfinite(Y_matrix), axis=1)
+    X  = X[valid].astype("float32")
+    Y  = Y_matrix[valid].astype("float32")
+    lat    = lat[valid]
+    months = months[valid]
+
+    C = np.column_stack([lat, lat**2,
+                         np.sin(2 * np.pi * months / 12),
+                         np.cos(2 * np.pi * months / 12)])
+
+    reg_x    = LinearRegression(fit_intercept=True).fit(C, X)
+    X_deconf = X - reg_x.predict(C)
+
+    Y_deconf = np.zeros_like(Y)
+    for j in range(Y.shape[1]):
+        reg_y = LinearRegression(fit_intercept=True).fit(C, Y[:, j])
+        Y_deconf[:, j] = Y[:, j] - reg_y.predict(C)
+
+    sx = StandardScaler(); sy = StandardScaler()
+    X_sc = sx.fit_transform(X_deconf)
+    Y_sc = sy.fit_transform(Y_deconf)
+
+    n_pca_act = min(n_pca, X.shape[1] - 1, X.shape[0] // 10)
+    pca = PCA(n_components=n_pca_act, random_state=42)
+    X_pca = pca.fit_transform(X_sc)
+    print(f"  [{tag}] PCA({n_pca_act}): {pca.explained_variance_ratio_.sum()*100:.1f}% variance retained")
+
+    n_comp = min(CCA_N_COMPONENTS, Y.shape[1])
+    X_tr, X_te, Y_tr, Y_te = train_test_split(X_pca, Y_sc, test_size=0.2, random_state=42)
+    cca = CCA(n_components=n_comp, max_iter=2000).fit(X_tr, Y_tr)
+    Xc_te, Yc_te = cca.transform(X_te, Y_te)
+
+    rs_pearson, rs_spearman = [], []
+    for k in range(n_comp):
+        pr, _ = pearsonr(Xc_te[:, k], Yc_te[:, k])
+        sr, _ = spearmanr(Xc_te[:, k], Yc_te[:, k])
+        rs_pearson.append(pr)
+        rs_spearman.append(sr)
+        print(f"  [{tag}] CCA{k+1}: Pearson r = {pr:.4f}  Spearman rho = {sr:.4f}  (20% test)")
+
+    phys_dirs = []
+    for k in range(n_comp):
+        d = pca.components_.T @ cca.x_weights_[:, k]
+        d /= np.linalg.norm(d)
+        phys_dirs.append(d)
+
+    Xc_all, _ = cca.transform(X_pca, Y_sc)
+
+    return dict(
+        rs_pearson=rs_pearson,
+        rs_spearman=rs_spearman,
+        phys_dirs=phys_dirs,
+        scaler_X=sx,
+        X_deconf=X_deconf,
+        X_raw=X,
+        cca_scores=Xc_all,        # (N_valid, n_comp)
+        n_comp=n_comp,
+        target_names=target_names,
+        valid_mask=valid,
+    )
 
 
 # ── Bin-composite walk ───────────────────────────────────────────────────────
@@ -573,6 +653,84 @@ def pca_component_walk(X_vae, target_vals, lat, months, tag, phys_label, out_pat
     plt.close()
 
 
+# ── CCA-component composite walk ─────────────────────────────────────────────
+def cca_component_walk(X_vae, cca_scores, target_names, canonical_rs, tag, out_path,
+                       n_bins=9, batch_size=256):
+    """
+    One composite row per CCA component from run_cca_multi.
+
+    Bins tiles by their canonical score Xc_k (not raw variable values), so
+    each row is a pure walk along that CCA direction in latent space.
+    CCA1 will likely be the brightness/EIS axis; CCA2/CCA3 should capture
+    structural variance orthogonal to it (driven by omega500, SST, etc.).
+
+    X_vae must already be filtered to the same valid rows as cca_scores.
+    """
+    import torch
+    import sys
+    sys.path.insert(0, str(Path(__file__).parent))
+    from vae import VAELightningModule
+
+    n_comp     = cca_scores.shape[1]
+    device     = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    model      = VAELightningModule.load_from_checkpoint(CHECKPOINT)
+    model.to(device).eval()
+    print(f"  VAE loaded on {device}")
+
+    X_v        = X_vae.astype("float32")
+    targets_str = " + ".join(target_names)
+
+    fig, axes = plt.subplots(n_comp, n_bins,
+                             figsize=(n_bins * 2.4, n_comp * 2.8),
+                             facecolor="#1a1a1a")
+    if n_comp == 1:
+        axes = axes[np.newaxis, :]
+
+    fig.suptitle(
+        f"Multivariate CCA walk — [{targets_str}]  {tag}\n"
+        f"(each row = CCA direction k; composites binned by canonical score Xc_k)",
+        color="white", fontsize=9, fontweight="bold")
+
+    for k in range(n_comp):
+        scores = cca_scores[:, k]
+        edges  = np.percentile(scores, np.linspace(0, 100, n_bins + 1))
+        edges[0] -= 1e-6; edges[-1] += 1e-6
+
+        print(f"  CCA{k+1} (r={canonical_rs[k]:.3f}): computing composites...")
+        row_composites = []
+        for i in range(n_bins):
+            mask  = (scores >= edges[i]) & (scores < edges[i + 1])
+            X_bin = X_v[mask]
+            decoded = []
+            with torch.no_grad():
+                for start in range(0, len(X_bin), batch_size):
+                    z   = torch.tensor(X_bin[start:start + batch_size],
+                                       dtype=torch.float32).to(device)
+                    out = model.decoder(z).cpu().numpy()
+                    decoded.append(np.mean(out, axis=1))
+            row_composites.append(np.mean(np.concatenate(decoded, axis=0), axis=0))
+
+        all_vals = np.concatenate([c.ravel() for c in row_composites])
+        lo, hi   = np.percentile(all_vals, [2, 98])
+        for i, composite in enumerate(row_composites):
+            img = np.clip((composite - lo) / (hi - lo + 1e-8), 0, 1)
+            ax  = axes[k, i]
+            ax.imshow(img, cmap="bone", vmin=0, vmax=1)
+            ax.set_xticks([]); ax.set_yticks([])
+            for sp in ax.spines.values():
+                sp.set_edgecolor("#555")
+            if i == 0:
+                ax.set_ylabel(f"CCA{k+1}\nr={canonical_rs[k]:.3f}",
+                              color="white", fontsize=8, rotation=90, labelpad=4)
+            if k == 0:
+                ax.set_title(f"bin {i+1}", color="#aaa", fontsize=8, pad=3)
+
+    plt.tight_layout(rect=[0, 0.02, 1, 0.91])
+    plt.savefig(out_path, dpi=150, bbox_inches="tight", facecolor="#1a1a1a")
+    print(f"  Saved -> {out_path}")
+    plt.close()
+
+
 # ── Decoded walk (CCA direction — kept for reference) ────────────────────────
 def decoded_walk(pipe, var_vals, tag, phys_label, out_path):
     """Walk the VAE decoder along the CCA direction. Requires VAE checkpoint."""
@@ -710,6 +868,14 @@ def main():
         print(f"  EIS matching failed ({e}) — skipping EIS runs")
         eis = None
 
+    print("Matching omega500...")
+    try:
+        omega500 = match_omega500(ds_era5, era5_tree, df_ocean)
+        print(f"  omega500 valid: {np.isfinite(omega500).sum():,}")
+    except Exception as e:
+        print(f"  omega500 matching failed ({e}) — skipping multivariate CCA")
+        omega500 = None
+
     # 4. Run CCA
     results = []
 
@@ -731,6 +897,21 @@ def main():
         print("=" * 60)
         pipe_vae_eis = run_cca(X_vae_oc, eis, lat_oc, mon_oc, N_PCA_VAE, tag="VAE-EIS")
         results.append(("VAE", "EIS", pipe_vae_eis["r_pearson"], pipe_vae_eis["r_spearman"]))
+
+    pipe_multi = None
+    if eis is not None and omega500 is not None:
+        print("\n" + "=" * 60)
+        print("Run 4 — VAE x [EIS, SST, omega500] multivariate CCA")
+        print("=" * 60)
+        Y_multi = np.column_stack([eis, sst_oc, omega500])
+        pipe_multi = run_cca_multi(
+            X_vae_oc, Y_multi,
+            target_names=["EIS", "SST", "omega500"],
+            lat=lat_oc, months=mon_oc,
+            n_pca=N_PCA_VAE, tag="VAE-multi",
+        )
+        for k, (pr, sr) in enumerate(zip(pipe_multi["rs_pearson"], pipe_multi["rs_spearman"])):
+            results.append((f"VAE-CCA{k+1}", "[EIS,SST,w500]", pr, sr))
 
     # 5. Bin-composite walks (needs checkpoint)
     has_ckpt = os.path.exists(CHECKPOINT)
@@ -800,6 +981,18 @@ def main():
                 out_path    = os.path.join(OUT_DIR, "walk_pca_eis.png"),
             )
 
+        if pipe_multi is not None:
+            print("\nMultivariate CCA component walk — [EIS, SST, omega500]...")
+            X_multi_valid = X_vae_oc[pipe_multi["valid_mask"]]
+            cca_component_walk(
+                X_vae        = X_multi_valid,
+                cca_scores   = pipe_multi["cca_scores"],
+                target_names = pipe_multi["target_names"],
+                canonical_rs = pipe_multi["rs_pearson"],
+                tag          = "(20-year Pelican, unblinded)",
+                out_path     = os.path.join(OUT_DIR, "walk_cca_multi.png"),
+            )
+
     # 6. Save r values
     results_path = os.path.join(OUT_DIR, "cca_results.txt")
     with open(results_path, "w") as f:
@@ -825,10 +1018,15 @@ def main():
     if eis is not None:
         wandb_metrics["VAE_EIS_pearson_r"]  = pipe_vae_eis["r_pearson"]
         wandb_metrics["VAE_EIS_spearman_r"] = pipe_vae_eis["r_spearman"]
+    if pipe_multi is not None:
+        for k, (pr, sr) in enumerate(zip(pipe_multi["rs_pearson"], pipe_multi["rs_spearman"])):
+            wandb_metrics[f"VAE_multi_CCA{k+1}_pearson_r"]  = pr
+            wandb_metrics[f"VAE_multi_CCA{k+1}_spearman_r"] = sr
 
     png_keys = [
         "walk_composite_sst", "walk_mosaic_sst", "walk_pca_sst",
         "walk_composite_eis", "walk_mosaic_eis", "walk_pca_eis",
+        "walk_cca_multi",
     ]
     for key in png_keys:
         p = os.path.join(OUT_DIR, f"{key}.png")
