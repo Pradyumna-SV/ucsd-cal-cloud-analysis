@@ -43,7 +43,7 @@ spec:
         - name: WANDB_PROJECT
           value: "ucsd-cal-cloud-cca"
         - name: WANDB_RUN_NAME
-          value: "multi-cca3-eis-sst-omega500"
+          value: "figures-umap-geo-regime"
         - name: WANDB_API_KEY
           valueFrom:
             secretKeyRef:
@@ -70,7 +70,8 @@ spec:
               xarray zarr gcsfs \
               pytorch-lightning \
               matplotlib \
-              wandb
+              wandb \
+              umap-learn
 
             mkdir -p /workspace/results/cca_20yr
             mkdir -p /workspace/logs

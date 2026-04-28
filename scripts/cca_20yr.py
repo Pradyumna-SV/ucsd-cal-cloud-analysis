@@ -319,7 +319,8 @@ def run_cca(X, target, lat, months, n_pca, tag=""):
     return dict(r_pearson=pr, r_spearman=sr,
                 physics_dir=phys_dir, scaler_X=sx,
                 X_deconf=X_deconf, X_raw=X,
-                physics_scores=Xc_all.flatten())
+                physics_scores=Xc_all.flatten(),
+                valid_mask=valid)
 
 
 # ── Multivariate CCA pipeline ───────────────────────────────────────────────
@@ -731,6 +732,203 @@ def cca_component_walk(X_vae, cca_scores, target_names, canonical_rs, tag, out_p
     plt.close()
 
 
+# ── Figure 1: UMAP of VAE embeddings coloured by EIS / SST ───────────────────
+def plot_umap(X_vae, sst, eis, lat, months, tag, out_path):
+    """
+    PCA(50) → UMAP(2D) on deconfounded VAE embeddings.
+    Two panels: left coloured by deconfounded EIS residual,
+                right coloured by deconfounded SST residual.
+    Shows whether EIS/SST structure is geometrically organised in
+    the embedding space — no decoder, no CCA direction needed.
+    """
+    from umap import UMAP
+
+    valid = np.isfinite(eis) & np.isfinite(sst)
+    X_v   = X_vae[valid].astype("float32")
+    eis_v = eis[valid]
+    sst_v = sst[valid]
+    lat_v = lat[valid]
+    mon_v = months[valid]
+    print(f"  [UMAP] {valid.sum():,} tiles with valid EIS+SST")
+
+    C        = np.column_stack([lat_v, lat_v**2,
+                                np.sin(2 * np.pi * mon_v / 12),
+                                np.cos(2 * np.pi * mon_v / 12)])
+    X_deconf = X_v - LinearRegression(fit_intercept=True).fit(C, X_v).predict(C)
+    eis_res  = eis_v - LinearRegression(fit_intercept=True).fit(C, eis_v).predict(C)
+    sst_res  = sst_v - LinearRegression(fit_intercept=True).fit(C, sst_v).predict(C)
+
+    X_sc  = StandardScaler().fit_transform(X_deconf)
+    X_pca = PCA(n_components=50, random_state=42).fit_transform(X_sc)
+    print(f"  [UMAP] running UMAP on {len(X_pca):,} x 50D embeddings...")
+    embed_2d = UMAP(n_components=2, n_neighbors=15, min_dist=0.1,
+                    random_state=42, low_memory=True).fit_transform(X_pca)
+
+    fig, axes = plt.subplots(1, 2, figsize=(16, 7), facecolor="#111")
+    fig.suptitle(f"VAE embedding UMAP — coloured by deconfounded EIS and SST  {tag}",
+                 color="white", fontsize=11, fontweight="bold")
+
+    for ax, residuals, label, cmap in zip(
+            axes,
+            [eis_res,         sst_res],
+            ["EIS residual (K)", "SST residual (°C)"],
+            ["RdBu_r",        "RdYlBu_r"]):
+        vmax = np.percentile(np.abs(residuals), 95)
+        sc   = ax.scatter(embed_2d[:, 0], embed_2d[:, 1],
+                          c=residuals, cmap=cmap, s=0.8, alpha=0.35,
+                          vmin=-vmax, vmax=vmax, rasterized=True,
+                          linewidths=0)
+        cb = plt.colorbar(sc, ax=ax, shrink=0.75, pad=0.02)
+        cb.set_label(label, color="white", fontsize=9)
+        cb.ax.yaxis.set_tick_params(color="white")
+        plt.setp(cb.ax.yaxis.get_ticklabels(), color="white")
+        ax.set_title(label, color="white", fontsize=10, pad=6)
+        ax.set_xticks([]); ax.set_yticks([])
+        ax.set_facecolor("#111")
+        for sp in ax.spines.values():
+            sp.set_edgecolor("#444")
+
+    plt.tight_layout()
+    plt.savefig(out_path, dpi=150, bbox_inches="tight", facecolor="#111")
+    print(f"  Saved -> {out_path}")
+    plt.close()
+
+
+# ── Figure 2: Geographic hexbin of CCA scores ────────────────────────────────
+def plot_geo_cca(lon, lat, scores_sst, mask_sst, scores_eis, mask_eis, tag, out_path):
+    """
+    Two-panel hexbin world map.
+    Left:  SST CCA canonical score per tile.
+    Right: EIS CCA canonical score per tile.
+    Tiles are aggregated by mean CCA score within each hex cell so that
+    dense regions (Sc decks) don't visually dominate through sheer dot count.
+    """
+    fig, axes = plt.subplots(1, 2, figsize=(20, 6), facecolor="#111")
+    fig.suptitle(f"Geographic distribution of VAE CCA scores  {tag}",
+                 color="white", fontsize=11, fontweight="bold")
+
+    pairs = [
+        (scores_sst, mask_sst, "SST CCA score"),
+        (scores_eis, mask_eis, "EIS CCA score"),
+    ]
+    for ax, (scores, mask, label) in zip(axes, pairs):
+        lo_v = lon[mask]
+        la_v = lat[mask]
+        lo_180 = np.where(lo_v > 180, lo_v - 360, lo_v)
+
+        vmax = np.percentile(np.abs(scores), 98)
+        hb   = ax.hexbin(lo_180, la_v, C=scores,
+                         reduce_C_function=np.mean,
+                         gridsize=120, cmap="RdBu_r",
+                         vmin=-vmax, vmax=vmax,
+                         extent=[-180, 180, -60, 60],
+                         linewidths=0.1)
+        cb = plt.colorbar(hb, ax=ax, shrink=0.8, pad=0.02)
+        cb.set_label(label, color="white", fontsize=9)
+        cb.ax.yaxis.set_tick_params(color="white")
+        plt.setp(cb.ax.yaxis.get_ticklabels(), color="white")
+
+        ax.set_xlim(-180, 180); ax.set_ylim(-60, 60)
+        ax.set_facecolor("#111")
+        ax.set_title(label, color="white", fontsize=10, pad=6)
+        ax.set_xlabel("Longitude", color="#aaa", fontsize=8)
+        ax.set_ylabel("Latitude",  color="#aaa", fontsize=8)
+        ax.tick_params(colors="#aaa", labelsize=7)
+        for sp in ax.spines.values():
+            sp.set_edgecolor("#444")
+        ax.set_xticks(range(-180, 181, 60))
+        ax.set_yticks(range(-60, 61, 30))
+        ax.grid(color="#333", linewidth=0.4, linestyle="--")
+
+    plt.tight_layout()
+    plt.savefig(out_path, dpi=150, bbox_inches="tight", facecolor="#111")
+    print(f"  Saved -> {out_path}")
+    plt.close()
+
+
+# ── Figure 3: Per-regime CCA r values ────────────────────────────────────────
+_REGIMES = [
+    (-30, -10, -100, -70,  "SE Pacific\n(Sc deck)"),
+    (-30, -10,  -20,   5,  "SE Atlantic\n(Sc deck)"),
+    ( 15,  35, -140, -110, "NE Pacific\n(Sc deck)"),
+    (-20,  20,  -60,  20,  "Tropical\nAtlantic"),
+    (-20,  20,   40, 100,  "Tropical\nIndian"),
+    (-20,  20,  120, 180,  "Tropical\nW Pacific"),
+]
+
+def plot_regime_r(X_vae, sst, eis, lat, lon, months, n_pca,
+                  global_r_sst, global_r_eis, tag, out_path,
+                  min_tiles=500):
+    """
+    Run CCA(1) vs SST and vs EIS independently within 6 pre-defined ocean
+    cloud-regime boxes.  Grouped bar chart with global r as reference lines.
+    Shows whether the VAE-physics correlation is concentrated in the Sc decks.
+    """
+    lon_180 = np.where(lon > 180, lon - 360, lon)
+
+    names, rs_sst, rs_eis, ns = [], [], [], []
+    for lat_min, lat_max, lon_min, lon_max, name in _REGIMES:
+        mask = ((lat  >= lat_min) & (lat  <= lat_max) &
+                (lon_180 >= lon_min) & (lon_180 <= lon_max))
+        n = int(mask.sum())
+        if n < min_tiles:
+            print(f"  [regime] {name!r}: only {n} tiles — skip")
+            continue
+        X_r   = X_vae[mask]
+        sst_r = sst[mask]
+        eis_r = eis[mask]
+        lat_r = lat[mask]
+        mon_r = months[mask]
+        try:
+            pr_sst = run_cca(X_r, sst_r, lat_r, mon_r, n_pca,
+                             tag=f"regime-{name[:8]}-SST")["r_pearson"]
+            pr_eis = run_cca(X_r, eis_r, lat_r, mon_r, n_pca,
+                             tag=f"regime-{name[:8]}-EIS")["r_pearson"]
+            names.append(name); rs_sst.append(pr_sst)
+            rs_eis.append(pr_eis); ns.append(n)
+            print(f"  [regime] {name!r}: SST r={pr_sst:.3f}  EIS r={pr_eis:.3f}  n={n:,}")
+        except Exception as e:
+            print(f"  [regime] {name!r}: failed ({e})")
+
+    if not names:
+        print("  [regime] no valid regimes — skipping figure")
+        return
+
+    x     = np.arange(len(names))
+    width = 0.35
+    fig, ax = plt.subplots(figsize=(max(10, len(names) * 2), 5), facecolor="#111")
+    ax.set_facecolor("#111")
+
+    ax.bar(x - width / 2, rs_sst, width, label="SST", color="#4FC3F7", alpha=0.85)
+    ax.bar(x + width / 2, rs_eis, width, label="EIS", color="#FF8A65", alpha=0.85)
+
+    ax.axhline(global_r_sst, color="#4FC3F7", linewidth=1.2,
+               linestyle="--", alpha=0.6, label=f"Global SST r={global_r_sst:.3f}")
+    ax.axhline(global_r_eis, color="#FF8A65", linewidth=1.2,
+               linestyle="--", alpha=0.6, label=f"Global EIS r={global_r_eis:.3f}")
+    ax.axhline(0, color="#666", linewidth=0.6)
+
+    for i, n in enumerate(ns):
+        ax.text(i, ax.get_ylim()[0] * 0.95 if ax.get_ylim()[0] < 0 else -0.01,
+                f"n={n:,}", ha="center", color="#888", fontsize=7)
+
+    ax.set_xticks(x)
+    ax.set_xticklabels(names, color="white", fontsize=9)
+    ax.set_ylabel("Pearson r (20% held-out test)", color="white", fontsize=9)
+    ax.set_title(f"VAE-CCA Pearson r by ocean cloud regime  {tag}",
+                 color="white", fontsize=11, fontweight="bold")
+    ax.tick_params(colors="white")
+    for sp in ax.spines.values():
+        sp.set_edgecolor("#444")
+    legend = ax.legend(facecolor="#222", labelcolor="white", fontsize=8,
+                       framealpha=0.8)
+
+    plt.tight_layout()
+    plt.savefig(out_path, dpi=150, bbox_inches="tight", facecolor="#111")
+    print(f"  Saved -> {out_path}")
+    plt.close()
+
+
 # ── Decoded walk (CCA direction — kept for reference) ────────────────────────
 def decoded_walk(pipe, var_vals, tag, phys_label, out_path):
     """Walk the VAE decoder along the CCA direction. Requires VAE checkpoint."""
@@ -857,6 +1055,7 @@ def main():
     X_t2v_oc = X_t2v[ocean]
     sst_oc   = sst[ocean]
     lat_oc   = df_ocean["lat"].values
+    lon_oc   = df_ocean["lon"].values
     mon_oc   = df_ocean["time"].dt.month.values
 
     print("Matching EIS (this loads several pressure-level fields)...")
@@ -897,6 +1096,53 @@ def main():
         print("=" * 60)
         pipe_vae_eis = run_cca(X_vae_oc, eis, lat_oc, mon_oc, N_PCA_VAE, tag="VAE-EIS")
         results.append(("VAE", "EIS", pipe_vae_eis["r_pearson"], pipe_vae_eis["r_spearman"]))
+
+    # 4b. Embedding-space figures (no decoder needed)
+    print("\n" + "=" * 60)
+    print("Figure 1 — UMAP")
+    print("=" * 60)
+    if eis is not None:
+        plot_umap(
+            X_vae  = X_vae_oc,
+            sst    = sst_oc,
+            eis    = eis,
+            lat    = lat_oc,
+            months = mon_oc,
+            tag    = "(20-year Pelican, unblinded)",
+            out_path = os.path.join(OUT_DIR, "fig_umap.png"),
+        )
+
+    print("\n" + "=" * 60)
+    print("Figure 2 — Geographic CCA scores")
+    print("=" * 60)
+    plot_geo_cca(
+        lon        = lon_oc,
+        lat        = lat_oc,
+        scores_sst = pipe_vae_sst["physics_scores"],
+        mask_sst   = pipe_vae_sst["valid_mask"],
+        scores_eis = pipe_vae_eis["physics_scores"] if eis is not None else np.array([]),
+        mask_eis   = pipe_vae_eis["valid_mask"]     if eis is not None else np.zeros(len(lon_oc), dtype=bool),
+        tag        = "(20-year Pelican, unblinded)",
+        out_path   = os.path.join(OUT_DIR, "fig_geo_cca.png"),
+    )
+
+    print("\n" + "=" * 60)
+    print("Figure 3 — Per-regime r values")
+    print("=" * 60)
+    if eis is not None:
+        plot_regime_r(
+            X_vae       = X_vae_oc,
+            sst         = sst_oc,
+            eis         = eis,
+            lat         = lat_oc,
+            lon         = lon_oc,
+            months      = mon_oc,
+            n_pca       = N_PCA_VAE,
+            global_r_sst = pipe_vae_sst["r_pearson"],
+            global_r_eis = pipe_vae_eis["r_pearson"],
+            tag         = "(20-year Pelican, unblinded)",
+            out_path    = os.path.join(OUT_DIR, "fig_regime_r.png"),
+        )
 
     pipe_multi = None
     if eis is not None and omega500 is not None:
@@ -1027,6 +1273,7 @@ def main():
         "walk_composite_sst", "walk_mosaic_sst", "walk_pca_sst",
         "walk_composite_eis", "walk_mosaic_eis", "walk_pca_eis",
         "walk_cca_multi",
+        "fig_umap", "fig_geo_cca", "fig_regime_r",
     ]
     for key in png_keys:
         p = os.path.join(OUT_DIR, f"{key}.png")
