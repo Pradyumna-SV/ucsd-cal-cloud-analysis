@@ -110,26 +110,3 @@ spec:
           value: "amd64"
           operator: Equal
           effect: NoSchedule
-
-      affinity:
-        nodeAffinity:
-          requiredDuringSchedulingIgnoredDuringExecution:
-            nodeSelectorTerms:
-            - matchExpressions:
-              - key: nvidia.com/gpu.product
-                operator: In
-                values:
-                  - NVIDIA-GeForce-RTX-3090
-                  - NVIDIA-GeForce-RTX-4090
-                  - NVIDIA-RTX-A5000
-                  - NVIDIA-TITAN-RTX
-              - key: kubernetes.io/hostname
-                operator: NotIn
-                values:
-                  - sphinx.sdstate.edu
-                  - k8s-haosu-09.sdsc.optiputer.net
-                  - node-2-3.sdsc.optiputer.net
-                  - node-2-2.sdsc.optiputer.net
-                  - node-1-1.sdsc.optiputer.net
-                  - gp-engine.beocat.ksu.edu
-                  - gpengine-uams.areon.net
