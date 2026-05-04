@@ -22,6 +22,7 @@ Environment variables (all have defaults):
   MAX_PER_DAY   max tiles to keep per day        default: 200
 """
 
+import hashlib
 import json
 import os
 import re
@@ -52,6 +53,7 @@ warnings.filterwarnings("ignore")
 # ── Config ─────────────────────────────────────────────────────────────────
 EMBED_DIR     = os.environ.get("EMBED_DIR",     "/workspace/embeddings")
 OUT_DIR       = os.environ.get("OUT_DIR",       "/workspace/results")
+CACHE_DIR     = os.environ.get("CACHE_DIR",     OUT_DIR)
 CHECKPOINT    = os.environ.get("CHECKPOINT",    "/workspace/vae_checkpoint/lightning_model_50_transform.pt")
 MANIFEST      = os.environ.get("MANIFEST",      "/workspace/repo/manifest.csv")
 STREAM_STRIDE = int(os.environ.get("STREAM_STRIDE", 11))
@@ -105,6 +107,21 @@ def parse_modis_ts(key: str) -> pd.Timestamp:
 
 
 # ── ERA5 setup ─────────────────────────────────────────────────────────────
+# All variables fetched in a single loop over unique days.
+_ERA5_SPECS = [
+    # (xarray varname,           pressure level,  output key)
+    ("sea_surface_temperature",  None,            "sst_raw"),
+    ("temperature",              700,             "T700"),
+    ("temperature",              850,             "T850"),
+    ("temperature",              1000,            "T1000"),
+    ("specific_humidity",        850,             "q850"),
+    ("specific_humidity",        1000,            "q1000"),
+    ("geopotential",             700,             "Phi700"),
+    ("2m_temperature",           None,            "T2m"),
+    ("vertical_velocity",        500,             "omega500"),
+]
+
+
 def open_era5():
     print("Opening ARCO-ERA5 (GCS, anonymous)...")
     gcs = gcsfs.GCSFileSystem(token="anon")
@@ -118,104 +135,141 @@ def open_era5():
     return ds, tree
 
 
-def _match_var(ds, tree, df, varname, level=None):
-    """Match a single ERA5 variable to a dataframe of (lat, lon, time) rows."""
+def _match_all_batched(ds, tree, df):
+    """
+    Single-pass ERA5 match: loop over unique days once, load all required
+    variables together per day, extract values for every tile.
+    Returns dict of output_key -> np.ndarray (len = len(df), NaN where missing).
+    """
     lats     = df["lat"].values
     lons     = df["lon"].values
-    times    = pd.to_datetime(df["time"], errors="coerce")   # bad timestamps -> NaT
-    lons_pos = np.where(lons < 0, lons + 360, lons)          # ERA5 uses 0-360
+    times    = pd.to_datetime(df["time"], errors="coerce")
+    lons_pos = np.where(lons < 0, lons + 360, lons)   # ERA5 uses 0-360
     _, sp_idx = tree.query(np.column_stack([lats, lons_pos]))
-    out      = np.full(len(df), np.nan)
 
-    da = ds[varname]
-    if level is not None:
-        da = da.sel(level=level)
+    outputs = {key: np.full(len(df), np.nan) for _, _, key in _ERA5_SPECS}
 
-    # Filter to valid (non-NaT) timestamps only.
-    # Avoid .dt.date — it goes through Python datetime which rejects year 0.
-    # Use .dt.year/.dt.month/.dt.day (pure pandas int arithmetic) instead.
+    # Filter to valid, in-era timestamps (same guards as the old _match_var).
     valid_mask = times.notna()
     if not valid_mask.any():
-        return out
+        return outputs
     valid_idx   = np.where(valid_mask)[0]
     valid_times = times.iloc[valid_idx]
-
     yr  = valid_times.dt.year.values
     mo  = valid_times.dt.month.values
     dy  = valid_times.dt.day.values
-    # Additional guard: keep only dates in the plausible MODIS era (2000-2023)
-    era_mask  = (yr >= 2000) & (yr <= 2023)
-    valid_idx = valid_idx[era_mask]
-    yr, mo, dy = yr[era_mask], mo[era_mask], dy[era_mask]
+    era_mask    = (yr >= 2000) & (yr <= 2023)
+    valid_idx   = valid_idx[era_mask]
+    yr, mo, dy  = yr[era_mask], mo[era_mask], dy[era_mask]
     valid_times = times.iloc[valid_idx]
 
-    date_strs = np.array([f"{y:04d}-{m:02d}-{d:02d}" for y, m, d in zip(yr, mo, dy)])
-
+    date_strs    = np.array([f"{y:04d}-{m:02d}-{d:02d}" for y, m, d in zip(yr, mo, dy)])
     unique_dates = np.unique(date_strs)
-    n_ok, n_fail = 0, 0
-    first_err = None
+
+    # Only request variables that actually exist in this ERA5 dataset.
+    avail_vars   = set(ds.data_vars)
+    active_specs = [(v, l, k) for v, l, k in _ERA5_SPECS if v in avail_vars]
+    unique_vars  = list(dict.fromkeys(v for v, _, _ in active_specs))
+    skipped      = [k for v, _, k in _ERA5_SPECS if v not in avail_vars]
+    if skipped:
+        print(f"  [batch] variables not in dataset, skipped: {skipped}")
+
+    n_ok, n_fail, first_err = 0, 0, None
     for date_str in unique_dates:
         in_date  = date_strs == date_str
         row_idxs = valid_idx[in_date]
         try:
-            day_da    = da.sel(time=date_str).load()
-            day_times = pd.DatetimeIndex(day_da["time"].values)
-            flat      = day_da.values.reshape(len(day_times), -1)
-            for i in row_idxs:
-                ti = day_times.get_indexer([times.iloc[i]], method="nearest")[0]
-                if ti >= 0:
-                    out[i] = float(flat[ti, sp_idx[i]])
+            day_ds    = ds[unique_vars].sel(time=date_str).load()
+            day_times = pd.DatetimeIndex(day_ds["time"].values)
+            # Compute nearest time indices once per tile; reuse across all variables.
+            tile_tis  = day_times.get_indexer(times.iloc[row_idxs], method="nearest")
+            for varname, level, key in active_specs:
+                try:
+                    da   = day_ds[varname]
+                    if level is not None:
+                        da = da.sel(level=level)
+                    flat = da.values.reshape(len(day_times), -1)
+                    for j, (i, ti) in enumerate(zip(row_idxs, tile_tis)):
+                        if ti >= 0:
+                            outputs[key][i] = float(flat[ti, sp_idx[i]])
+                except Exception:
+                    pass  # leave NaN for this variable/day
             n_ok += 1
         except Exception as e:
             n_fail += 1
             if first_err is None:
                 first_err = f"{date_str}: {type(e).__name__}: {e}"
-    print(f"  [{varname}] days OK={n_ok} FAIL={n_fail}  "
-          f"valid_ts={len(valid_idx)}  matched={np.isfinite(out).sum()}")
+
+    print(f"  [batch] days OK={n_ok} FAIL={n_fail}  valid_ts={len(valid_idx)}  "
+          f"sst_matched={np.isfinite(outputs['sst_raw']).sum()}")
     if first_err:
-        print(f"  [{varname}] first failure: {first_err}")
-    return out
+        print(f"  [batch] first failure: {first_err}")
+    return outputs
 
 
-def match_sst(ds, tree, df):
-    raw = _match_var(ds, tree, df, "sea_surface_temperature")
-    # ERA5 SST is in Kelvin; convert and mask land (NaN where no SST)
-    return np.where(raw > 200, raw - 273.15, np.nan)
+def _compute_sst(raw):
+    """Convert raw ERA5 SST (K) to Celsius; NaN over land."""
+    r = raw["sst_raw"]
+    return np.where(r > 200, r - 273.15, np.nan)
 
 
-def match_eis(ds, tree, df):
+def _compute_eis(raw):
     """Estimated Inversion Strength (Wood & Bretherton 2006), in K."""
     Lv = 2.5e6; Rd = 287.0; Rv = 461.0; cp = 1005.0; g = 9.81
+    T700,  T850,  T1000 = raw["T700"],  raw["T850"],  raw["T1000"]
+    q850,  q1000         = raw["q850"],  raw["q1000"]
+    Phi700, T2m          = raw["Phi700"], raw["T2m"]
 
-    T700   = _match_var(ds, tree, df, "temperature",      level=700)
-    T850   = _match_var(ds, tree, df, "temperature",      level=850)
-    T1000  = _match_var(ds, tree, df, "temperature",      level=1000)
-    q850   = _match_var(ds, tree, df, "specific_humidity", level=850)
-    q1000  = _match_var(ds, tree, df, "specific_humidity", level=1000)
-    Phi700 = _match_var(ds, tree, df, "geopotential",     level=700)
-    T2m    = _match_var(ds, tree, df, "2m_temperature")
-
-    # LTS = theta_700 - theta_1000
-    lts = T700 * (1000 / 700) ** 0.286 - T1000
-
-    # Moist adiabatic lapse rate at 850 hPa (K/m)
-    e_s  = 6.112e2 * np.exp(17.67 * (T850 - 273.15) / (T850 - 29.65))
-    qs   = 0.622 * e_s / (85000 - 0.378 * e_s)
-    gm   = (g / cp) * (1 + Lv * qs / (Rd * T850)) / (1 + Lv**2 * qs / (cp * Rv * T850**2))
-    gm_km = gm * 1000  # K/km
-
+    lts    = T700 * (1000 / 700) ** 0.286 - T1000
+    e_s    = 6.112e2 * np.exp(17.67 * (T850 - 273.15) / (T850 - 29.65))
+    qs     = 0.622 * e_s / (85000 - 0.378 * e_s)
+    gm     = (g / cp) * (1 + Lv * qs / (Rd * T850)) / (1 + Lv**2 * qs / (cp * Rv * T850**2))
     z700_km = Phi700 / (g * 1000)
-
-    e_sfc   = np.clip(q1000 * 1013.25e2 / (0.622 + q1000), 10, 5000)
-    T_D     = (243.5 * np.log(e_sfc / 611.2) / (17.67 - np.log(e_sfc / 611.2))) + 273.15
-    z_lcl   = np.clip(0.125 * (T2m - T_D), 0, 3)  # km
-
-    return lts - gm_km * (z700_km - z_lcl)
+    e_sfc  = np.clip(q1000 * 1013.25e2 / (0.622 + q1000), 10, 5000)
+    T_D    = (243.5 * np.log(e_sfc / 611.2) / (17.67 - np.log(e_sfc / 611.2))) + 273.15
+    z_lcl  = np.clip(0.125 * (T2m - T_D), 0, 3)
+    return lts - gm * 1000 * (z700_km - z_lcl)
 
 
-def match_omega500(ds, tree, df):
-    """Vertical velocity omega (Pa/s) at 500 hPa. Negative=ascent, positive=subsidence."""
-    return _match_var(ds, tree, df, "vertical_velocity", level=500)
+# ── ERA5 disk cache ─────────────────────────────────────────────────────────
+def _era5_cache_key(df_meta: pd.DataFrame, stride: int) -> str:
+    """MD5 fingerprint of the loaded tile set (unique days + stride)."""
+    times = pd.to_datetime(df_meta["time"], errors="coerce").dropna()
+    dates = sorted({f"{t.year:04d}-{t.month:02d}-{t.day:02d}" for t in times})
+    raw   = f"stride={stride}|" + "|".join(dates)
+    return hashlib.md5(raw.encode()).hexdigest()
+
+
+def _save_era5_cache(path: Path, key: str, sst, eis, omega500):
+    np.savez_compressed(
+        str(path),
+        _key       = np.array([key]),
+        sst        = sst,
+        eis        = eis      if eis      is not None else np.array([np.nan]),
+        omega500   = omega500 if omega500 is not None else np.array([np.nan]),
+        _has_eis   = np.array([eis      is not None]),
+        _has_omega = np.array([omega500 is not None]),
+    )
+    print(f"  ERA5 cache saved -> {path}")
+
+
+def _load_era5_cache(path: Path, key: str):
+    """Returns (sst, eis, omega500) on cache hit, None on miss or key mismatch."""
+    if not path.exists():
+        return None
+    try:
+        c = np.load(str(path), allow_pickle=False)
+        if str(c["_key"][0]) != key:
+            print("  ERA5 cache key mismatch — re-matching from GCS.")
+            return None
+        sst      = c["sst"]
+        eis      = c["eis"]      if bool(c["_has_eis"][0])   else None
+        omega500 = c["omega500"] if bool(c["_has_omega"][0]) else None
+        print(f"  ERA5 cache HIT  ({path.name})")
+        return sst, eis, omega500
+    except Exception as e:
+        print(f"  ERA5 cache load error ({e}) — re-matching from GCS.")
+        return None
 
 
 # ── Local embedding loader ──────────────────────────────────────────────────
@@ -1041,12 +1095,39 @@ def main():
     X_t2v    = np.vstack(t2v_chunks).astype("float32")
     print(f"  VAE {X_vae.shape}   T2V {X_t2v.shape}")
 
-    # 3. Match ERA5
-    print("\nOpening ERA5...")
-    ds_era5, era5_tree = open_era5()
+    # 3. Match ERA5 — batched (all variables in one pass per day) + disk cache
+    print("\nChecking ERA5 cache...")
+    os.makedirs(CACHE_DIR, exist_ok=True)
+    cache_path = Path(CACHE_DIR) / "era5_matched.npz"
+    cache_key  = _era5_cache_key(df_meta, STREAM_STRIDE)
+    cached     = _load_era5_cache(cache_path, cache_key)
 
-    print("Matching SST...")
-    sst = match_sst(ds_era5, era5_tree, df_meta)
+    if cached is not None:
+        sst, eis, omega500 = cached
+    else:
+        print("Opening ERA5...")
+        ds_era5, era5_tree = open_era5()
+        print("Matching all ERA5 variables (batched, single pass per day)...")
+        raw = _match_all_batched(ds_era5, era5_tree, df_meta)
+
+        sst = _compute_sst(raw)
+
+        try:
+            eis = _compute_eis(raw)
+            print(f"  EIS valid: {np.isfinite(eis).sum():,}")
+        except Exception as e:
+            print(f"  EIS computation failed ({e}) — skipping EIS runs")
+            eis = None
+
+        try:
+            omega500 = raw["omega500"].copy()
+            print(f"  omega500 valid: {np.isfinite(omega500).sum():,}")
+        except Exception as e:
+            print(f"  omega500 failed ({e}) — skipping multivariate CCA")
+            omega500 = None
+
+        _save_era5_cache(cache_path, cache_key, sst, eis, omega500)
+
     ocean = np.isfinite(sst)
     print(f"  Ocean tiles: {ocean.sum():,} / {len(sst):,}")
 
@@ -1054,26 +1135,14 @@ def main():
     X_vae_oc = X_vae[ocean]
     X_t2v_oc = X_t2v[ocean]
     sst_oc   = sst[ocean]
+    # Filter EIS and omega500 to ocean tiles so downstream code is unchanged.
+    if eis is not None:
+        eis = eis[ocean]
+    if omega500 is not None:
+        omega500 = omega500[ocean]
     lat_oc   = df_ocean["lat"].values
     lon_oc   = df_ocean["lon"].values
     mon_oc   = df_ocean["time"].dt.month.values
-
-    print("Matching EIS (this loads several pressure-level fields)...")
-    try:
-        eis = match_eis(ds_era5, era5_tree, df_ocean)
-        eis_ok = np.isfinite(eis).sum()
-        print(f"  EIS valid: {eis_ok:,}")
-    except Exception as e:
-        print(f"  EIS matching failed ({e}) — skipping EIS runs")
-        eis = None
-
-    print("Matching omega500...")
-    try:
-        omega500 = match_omega500(ds_era5, era5_tree, df_ocean)
-        print(f"  omega500 valid: {np.isfinite(omega500).sum():,}")
-    except Exception as e:
-        print(f"  omega500 matching failed ({e}) — skipping multivariate CCA")
-        omega500 = None
 
     # 4. Run CCA
     results = []

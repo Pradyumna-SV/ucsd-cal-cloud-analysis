@@ -20,6 +20,8 @@ spec:
           value: /workspace/embeddings
         - name: OUT_DIR
           value: /workspace/results/cca_20yr
+        - name: CACHE_DIR
+          value: /workspace/era5_cache
         - name: CHECKPOINT
           value: /workspace/vae_checkpoint/lightning_model_50_transform.pt
         - name: MANIFEST
