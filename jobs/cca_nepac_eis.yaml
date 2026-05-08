@@ -57,6 +57,8 @@ spec:
           value: "/data/climate-analytics-lab-shared/Satellite/Unsupervised/triplet_data"
         - name: REMOTE_TMP_DIR
           value: "/home/sukhanna/tmp"
+        - name: REMOTE_PYTHON
+          value: "/home/sukhanna/miniconda3/bin/python"
 
         # ── Tile filter params ───────────────────────────────────────────────
         - name: REMOTE_N_FILES

@@ -121,9 +121,10 @@ def ssh_extract_tiles():
     stdout_mk.channel.recv_exit_status()
 
     # Install required packages on the remote server if not already present.
+    REMOTE_PYTHON = os.environ.get("REMOTE_PYTHON", "/home/sukhanna/miniconda3/bin/python")
     print("  Installing remote dependencies...")
     _, stdout_pip, stderr_pip = client.exec_command(
-        "python3 -m pip install --quiet netCDF4 global-land-mask scipy numpy 2>&1"
+        f"{REMOTE_PYTHON} -m pip install --quiet netCDF4 global-land-mask scipy numpy 2>&1"
     )
     pip_exit = stdout_pip.channel.recv_exit_status()
     if pip_exit != 0:
@@ -142,7 +143,7 @@ def ssh_extract_tiles():
 
     # Build the remote command.
     cmd = (
-        f"python3 {remote_script} "
+        f"{REMOTE_PYTHON} {remote_script} "
         f"--coord_dir  {REMOTE_COORD_DIR} "
         f"--myd06_dir  {REMOTE_MYD06_DIR} "
         f"--img_dir    {REMOTE_IMG_DIR} "
