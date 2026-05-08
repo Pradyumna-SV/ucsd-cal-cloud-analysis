@@ -50,13 +50,13 @@ spec:
 
         # ── Remote data paths — fill these in ───────────────────────────────
         - name: REMOTE_COORD_DIR
-          value: "FILL_IN_COORD_DIR"
+          value: "/data/climate-analytics-lab-shared/Satellite/Unsupervised/coordinates_data"
         - name: REMOTE_MYD06_DIR
-          value: "FILL_IN_MYD06_DIR"
+          value: "/data/climate-analytics-lab-shared/Satellite/MYD06_L2"
         - name: REMOTE_IMG_DIR
-          value: "FILL_IN_IMG_DIR"
+          value: "/data/climate-analytics-lab-shared/Satellite/Unsupervised/triplet_data"
         - name: REMOTE_TMP_DIR
-          value: "FILL_IN_TMP_DIR"
+          value: "/home/sukhanna/tmp"
 
         # ── Tile filter params ───────────────────────────────────────────────
         - name: REMOTE_N_FILES
