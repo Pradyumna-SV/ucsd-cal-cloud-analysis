@@ -123,7 +123,7 @@ def ssh_extract_tiles():
     # Install required packages on the remote server if not already present.
     print("  Installing remote dependencies...")
     _, stdout_pip, stderr_pip = client.exec_command(
-        "pip install --quiet netCDF4 global-land-mask scipy numpy 2>&1"
+        "python3 -m pip install --quiet netCDF4 global-land-mask scipy numpy 2>&1"
     )
     pip_exit = stdout_pip.channel.recv_exit_status()
     if pip_exit != 0:
