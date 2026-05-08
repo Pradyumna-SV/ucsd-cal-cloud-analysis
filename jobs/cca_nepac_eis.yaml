@@ -52,7 +52,7 @@ spec:
         - name: REMOTE_COORD_DIR
           value: "/data/climate-analytics-lab-shared/Satellite/Unsupervised/coordinates_data"
         - name: REMOTE_MYD06_DIR
-          value: "/data/climate-analytics-lab-shared/Satellite/MYD06_L2"
+          value: "/data/climate-analytics-lab-shared/Satellite/processed_test_data"
         - name: REMOTE_IMG_DIR
           value: "/data/climate-analytics-lab-shared/Satellite/Unsupervised/triplet_data"
         - name: REMOTE_TMP_DIR
