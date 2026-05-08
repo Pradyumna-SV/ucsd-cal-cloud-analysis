@@ -124,7 +124,7 @@ def ssh_extract_tiles():
     REMOTE_PYTHON = os.environ.get("REMOTE_PYTHON", "/home/sukhanna/miniconda3/bin/python")
     print("  Installing remote dependencies...")
     _, stdout_pip, stderr_pip = client.exec_command(
-        f"{REMOTE_PYTHON} -m pip install --quiet netCDF4 global-land-mask scipy numpy 2>&1"
+        f"{REMOTE_PYTHON} -m pip install --quiet netCDF4 pyhdf global-land-mask scipy numpy 2>&1"
     )
     pip_exit = stdout_pip.channel.recv_exit_status()
     if pip_exit != 0:

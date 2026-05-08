@@ -56,13 +56,20 @@ def is_daytime(lat, lon, utc_dt):
     return 6.0 <= local_hour <= 18.0
 
 
+_first_myd06_miss = None
+
 def find_myd06(nc_file, myd06_dir):
+    global _first_myd06_miss
     parts   = os.path.basename(nc_file).split(".")
     year    = parts[1][1:5]
     doy     = parts[1][5:]
     time    = parts[2]
-    pattern = os.path.join(myd06_dir, f"MYD06_L2.A{year}{doy}.{time}.*.nc")
+    # Match any extension (.nc, .hdf, .hdf5, etc.)
+    pattern = os.path.join(myd06_dir, f"MYD06_L2.A{year}{doy}.{time}.*")
     matches = glob.glob(pattern)
+    if not matches and _first_myd06_miss is None:
+        _first_myd06_miss = pattern
+        print(f"  [warn] first MYD06 miss — searched: {pattern}", flush=True)
     return matches[0] if matches else None
 
 
@@ -75,11 +82,25 @@ def get_cloud_fraction(lat, lon, nc_file, myd06_dir):
         return None
 
     if myd06_path not in _myd06_cache:
-        ds       = nc.Dataset(myd06_path, "r")
-        cf_lats  = ds.variables["latitude"][:].ravel()
-        cf_lons  = ds.variables["longitude"][:].ravel()
-        cf_vals  = np.ma.filled(ds.variables["Cloud_Fraction"][:], np.nan).ravel()
-        ds.close()
+        try:
+            ds      = nc.Dataset(myd06_path, "r")
+            cf_lats = ds.variables["latitude"][:].ravel()
+            cf_lons = ds.variables["longitude"][:].ravel()
+            cf_vals = np.ma.filled(ds.variables["Cloud_Fraction"][:], np.nan).ravel()
+            ds.close()
+        except Exception as e:
+            # HDF4 fallback via pyhdf
+            try:
+                from pyhdf.SD import SD, SDC
+                hdf     = SD(myd06_path, SDC.READ)
+                cf_lats = hdf.select("Latitude")[:].ravel().astype(np.float32)
+                cf_lons = hdf.select("Longitude")[:].ravel().astype(np.float32)
+                cf_raw  = hdf.select("Cloud_Fraction")[:].ravel().astype(np.float32)
+                cf_vals = np.where(cf_raw >= 0, cf_raw / 100.0, np.nan)
+                hdf.end()
+            except Exception as e2:
+                print(f"  [warn] could not open {myd06_path}: nc={e}  hdf={e2}", flush=True)
+                return None
 
         valid = np.isfinite(cf_vals)
         tree  = cKDTree(np.column_stack([cf_lats[valid], cf_lons[valid]]))
