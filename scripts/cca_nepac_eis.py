@@ -117,8 +117,20 @@ def ssh_extract_tiles():
     client.connect(SSH_HOST, port=SSH_PORT, username=SSH_USER, password=SSH_PASSWORD)
 
     # Ensure the remote tmp dir exists before transferring anything.
-    _, stdout_mk, stderr_mk = client.exec_command(f"mkdir -p {REMOTE_TMP_DIR}")
+    _, stdout_mk, _ = client.exec_command(f"mkdir -p {REMOTE_TMP_DIR}")
     stdout_mk.channel.recv_exit_status()
+
+    # Install required packages on the remote server if not already present.
+    print("  Installing remote dependencies...")
+    _, stdout_pip, stderr_pip = client.exec_command(
+        "pip install --quiet netCDF4 global-land-mask scipy numpy 2>&1"
+    )
+    pip_exit = stdout_pip.channel.recv_exit_status()
+    if pip_exit != 0:
+        for line in stderr_pip:
+            print(f"  [remote pip] {line.rstrip()}")
+        raise RuntimeError(f"Remote pip install failed with exit code {pip_exit}")
+    print("  Remote dependencies ready.")
 
     sftp = client.open_sftp()
 
