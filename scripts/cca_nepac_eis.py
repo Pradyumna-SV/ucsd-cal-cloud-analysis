@@ -141,6 +141,15 @@ def ssh_extract_tiles():
     print(f"  Uploading {local_script} -> {remote_script}")
     sftp.put(local_script, remote_script)
 
+    # Print the top-level MYD06 directory layout so we can see the structure.
+    print("  Checking remote MYD06 directory structure...")
+    _, stdout_ls, _ = client.exec_command(
+        f"ls {REMOTE_MYD06_DIR} 2>&1 | head -20"
+    )
+    for line in stdout_ls:
+        print(f"  [remote ls] {line.rstrip()}")
+    stdout_ls.channel.recv_exit_status()
+
     # Build the remote command.
     cmd = (
         f"{REMOTE_PYTHON} {remote_script} "
