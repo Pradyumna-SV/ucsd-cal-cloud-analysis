@@ -67,6 +67,14 @@ N_WALK_STEPS    = int(os.environ.get("N_WALK_STEPS",     9))
 WALK_SIGMA      = float(os.environ.get("WALK_SIGMA",     1.5))
 APPLY_CLAHE     = os.environ.get("APPLY_CLAHE", "0").strip().lower() in ("1", "true", "yes")
 
+# Optional: regress SST out of embeddings before VAE×EIS CCA (and EIS mosaic binning).
+SST_FIXED_EIS = os.environ.get("SST_FIXED_EIS", "0").strip().lower() in ("1", "true", "yes")
+# Optional regional subset (apply before ERA5). All four must be set to enable.
+REGION_LAT_MIN = os.environ.get("REGION_LAT_MIN", "").strip()
+REGION_LAT_MAX = os.environ.get("REGION_LAT_MAX", "").strip()
+REGION_LON_MIN = os.environ.get("REGION_LON_MIN", "").strip()
+REGION_LON_MAX = os.environ.get("REGION_LON_MAX", "").strip()
+
 # W&B
 WANDB_PROJECT  = os.environ.get("WANDB_PROJECT",  "ucsd-cal-cloud-cca")
 WANDB_RUN_NAME = os.environ.get("WANDB_RUN_NAME", None)   # auto-generated if not set
@@ -232,11 +240,11 @@ def _compute_eis(raw):
 
 
 # ── ERA5 disk cache ─────────────────────────────────────────────────────────
-def _era5_cache_key(df_meta: pd.DataFrame, stride: int) -> str:
-    """MD5 fingerprint of the loaded tile set (unique days + stride)."""
+def _era5_cache_key(df_meta: pd.DataFrame, stride: int, region_tag: str = "global") -> str:
+    """MD5 fingerprint of the loaded tile set (unique days + stride + region)."""
     times = pd.to_datetime(df_meta["time"], errors="coerce").dropna()
     dates = sorted({f"{t.year:04d}-{t.month:02d}-{t.day:02d}" for t in times})
-    raw   = f"stride={stride}|" + "|".join(dates)
+    raw   = f"stride={stride}|region={region_tag}|" + "|".join(dates)
     return hashlib.md5(raw.encode()).hexdigest()
 
 
@@ -334,18 +342,27 @@ def load_day(year, month, day):
 
 
 # ── CCA pipeline ───────────────────────────────────────────────────────────
-def run_cca(X, target, lat, months, n_pca, tag=""):
+def run_cca(X, target, lat, months, n_pca, tag="", sst_for_confound=None):
     """
-    Deconfound (lat, lat², sin/cos month) -> standardise -> PCA -> CCA(1).
+    Deconfound (lat, lat², sin/cos month) [+ SST if sst_for_confound set]
+    -> standardise -> PCA -> CCA(1).
     Fit on 80%, evaluate Pearson r on held-out 20%.
     Returns dict with r_pearson, r_spearman, physics_scores, X_deconf.
     """
     valid = np.isfinite(target)
+    if sst_for_confound is not None:
+        valid &= np.isfinite(sst_for_confound)
     X, target, lat, months = X[valid], target[valid], lat[valid], months[valid]
+    if sst_for_confound is not None:
+        sst_c = sst_for_confound[valid].astype("float64")
+    else:
+        sst_c = None
 
     C = np.column_stack([lat, lat**2,
                          np.sin(2 * np.pi * months / 12),
                          np.cos(2 * np.pi * months / 12)])
+    if sst_c is not None:
+        C = np.column_stack([C, sst_c])
     reg = LinearRegression(fit_intercept=True).fit(C, X)
     X_deconf = X - reg.predict(C)
 
@@ -541,11 +558,13 @@ def bin_composite_walk(X_vae, var_vals, lat, months, tag, phys_label, out_path,
 
 # ── Bin-mosaic walk ──────────────────────────────────────────────────────────
 def bin_mosaic_walk(X_vae, var_vals, lat, months, tag, phys_label, out_path,
-                    n_bins=9, n_samples=3, seed=42):
+                    n_bins=9, n_samples=3, seed=42, sst_for_residual=None):
     """
     Same binning as bin_composite_walk but shows n_samples individual decoded
     tiles per bin instead of their mean.  Averaging destroys cloud texture;
     individual tiles show what the VAE actually learned.
+
+    If sst_for_residual is set, EIS residuals also remove SST (same geometry+season+SST subspace).
     """
     import torch
     import sys
@@ -559,6 +578,8 @@ def bin_mosaic_walk(X_vae, var_vals, lat, months, tag, phys_label, out_path,
     print(f"  VAE loaded on {device}")
 
     valid = np.isfinite(var_vals)
+    if sst_for_residual is not None:
+        valid &= np.isfinite(sst_for_residual)
     X_v   = X_vae[valid].astype("float32")
     y_v   = var_vals[valid]
     lat_v = lat[valid]
@@ -568,6 +589,8 @@ def bin_mosaic_walk(X_vae, var_vals, lat, months, tag, phys_label, out_path,
     C     = np.column_stack([lat_v, lat_v**2,
                              np.sin(2 * np.pi * mon_v / 12),
                              np.cos(2 * np.pi * mon_v / 12)])
+    if sst_for_residual is not None:
+        C = np.column_stack([C, sst_for_residual[valid].astype("float64")])
     y_res = y_v - LinearRegression(fit_intercept=True).fit(C, y_v).predict(C)
 
     edges = np.percentile(y_res, np.linspace(0, 100, n_bins + 1))
@@ -591,9 +614,10 @@ def bin_mosaic_walk(X_vae, var_vals, lat, months, tag, phys_label, out_path,
     fig, axes = plt.subplots(n_samples, n_bins,
                              figsize=(n_bins * 2.4, n_samples * 2.5),
                              facecolor="#1a1a1a")
+    res_lbl = "lat/season/SST-deconfounded residual" if sst_for_residual is not None else "lat/season-deconfounded residual"
     fig.suptitle(
         f"VAE bin-mosaic walk — {phys_label}  {tag}\n"
-        f"(each panel = individual decoded tile; binned by lat/season-deconfounded residual)",
+        f"(each panel = individual decoded tile; binned by {res_lbl})",
         color="white", fontsize=9, fontweight="bold")
     for col in range(n_bins):
         for row in range(n_samples):
@@ -1060,6 +1084,11 @@ def main():
             walk_sigma=WALK_SIGMA,
             apply_clahe=APPLY_CLAHE,
             checkpoint=os.path.basename(CHECKPOINT),
+            sst_fixed_eis=SST_FIXED_EIS,
+            region_lat_min=REGION_LAT_MIN or None,
+            region_lat_max=REGION_LAT_MAX or None,
+            region_lon_min=REGION_LON_MIN or None,
+            region_lon_max=REGION_LON_MAX or None,
         ),
     )
 
@@ -1095,11 +1124,25 @@ def main():
     X_t2v    = np.vstack(t2v_chunks).astype("float32")
     print(f"  VAE {X_vae.shape}   T2V {X_t2v.shape}")
 
+    region_tag = "global"
+    if REGION_LAT_MIN and REGION_LAT_MAX and REGION_LON_MIN and REGION_LON_MAX:
+        rmn, rmx = float(REGION_LAT_MIN), float(REGION_LAT_MAX)
+        lmn, lmx = float(REGION_LON_MIN), float(REGION_LON_MAX)
+        latv, lonv = df_meta["lat"].values, df_meta["lon"].values
+        reg_mask = (latv >= rmn) & (latv <= rmx) & (lonv >= lmn) & (lonv <= lmx)
+        n_before = len(df_meta)
+        df_meta  = df_meta[reg_mask].reset_index(drop=True)
+        X_vae    = X_vae[reg_mask]
+        X_t2v    = X_t2v[reg_mask]
+        region_tag = f"{rmn}_{rmx}_{lmn}_{lmx}"
+        print(f"  Regional subset [{rmn},{rmx}]°N × [{lmn},{lmx}]°E: "
+              f"{len(df_meta):,} / {n_before:,} tiles")
+
     # 3. Match ERA5 — batched (all variables in one pass per day) + disk cache
     print("\nChecking ERA5 cache...")
     os.makedirs(CACHE_DIR, exist_ok=True)
     cache_path = Path(CACHE_DIR) / "era5_matched.npz"
-    cache_key  = _era5_cache_key(df_meta, STREAM_STRIDE)
+    cache_key  = _era5_cache_key(df_meta, STREAM_STRIDE, region_tag)
     cached     = _load_era5_cache(cache_path, cache_key)
 
     if cached is not None:
@@ -1161,9 +1204,12 @@ def main():
 
     if eis is not None:
         print("\n" + "=" * 60)
-        print("Run 3 — VAE (unblinded) x EIS (20-year, deconfounded)")
+        tag_eis = "Run 3 — VAE x EIS (20-year, SST partialled from embeddings)" if SST_FIXED_EIS else "Run 3 — VAE (unblinded) x EIS (20-year, deconfounded)"
+        print(tag_eis)
         print("=" * 60)
-        pipe_vae_eis = run_cca(X_vae_oc, eis, lat_oc, mon_oc, N_PCA_VAE, tag="VAE-EIS")
+        sst_conf = sst_oc if SST_FIXED_EIS else None
+        pipe_vae_eis = run_cca(X_vae_oc, eis, lat_oc, mon_oc, N_PCA_VAE,
+                               tag="VAE-EIS", sst_for_confound=sst_conf)
         results.append(("VAE", "EIS", pipe_vae_eis["r_pearson"], pipe_vae_eis["r_spearman"]))
 
     # 4b. Embedding-space figures (no decoder needed)
@@ -1283,7 +1329,8 @@ def main():
                 months     = mon_oc,
                 tag        = "(20-year Pelican, unblinded)",
                 phys_label = "EIS (K)",
-                out_path   = os.path.join(OUT_DIR, "walk_mosaic_eis.png"),
+                out_path   = os.path.join(OUT_DIR, "walk_mosaic_eis_sstfixed.png" if SST_FIXED_EIS else "walk_mosaic_eis.png"),
+                sst_for_residual = sst_oc if SST_FIXED_EIS else None,
             )
             print("\nPCA-component walk — EIS...")
             pca_component_walk(
@@ -1312,8 +1359,11 @@ def main():
     results_path = os.path.join(OUT_DIR, "cca_results.txt")
     with open(results_path, "w") as f:
         f.write("20-year MODIS cloud embedding CCA results\n")
-        f.write(f"Embeddings: {n_loaded} days, {len(df_ocean):,} ocean tiles\n")
-        f.write(f"Deconfounded by: lat, lat^2, sin(month), cos(month)\n")
+        deconf = ("lat, lat^2, sin(month), cos(month); VAE×EIS additionally partials SST from embeddings"
+                  if SST_FIXED_EIS else "lat, lat^2, sin(month), cos(month)")
+        f.write(f"Embeddings: {n_loaded} days, {len(df_ocean):,} ocean tiles"
+                + (f", region_tag={region_tag}\n" if region_tag != "global" else "\n"))
+        f.write(f"Deconfounded by: {deconf}\n")
         f.write(f"r from 20% held-out test set\n\n")
         f.write(f"{'Embedding':<8} {'Target':<6} {'Pearson r':>10} {'Spearman rho':>13}\n")
         f.write("-" * 42 + "\n")
@@ -1333,6 +1383,7 @@ def main():
     if eis is not None:
         wandb_metrics["VAE_EIS_pearson_r"]  = pipe_vae_eis["r_pearson"]
         wandb_metrics["VAE_EIS_spearman_r"] = pipe_vae_eis["r_spearman"]
+    wandb_metrics["sst_fixed_eis"] = int(SST_FIXED_EIS)
     if pipe_multi is not None:
         for k, (pr, sr) in enumerate(zip(pipe_multi["rs_pearson"], pipe_multi["rs_spearman"])):
             wandb_metrics[f"VAE_multi_CCA{k+1}_pearson_r"]  = pr
@@ -1340,7 +1391,7 @@ def main():
 
     png_keys = [
         "walk_composite_sst", "walk_mosaic_sst", "walk_pca_sst",
-        "walk_composite_eis", "walk_mosaic_eis", "walk_pca_eis",
+        "walk_composite_eis", "walk_mosaic_eis", "walk_mosaic_eis_sstfixed", "walk_pca_eis",
         "walk_cca_multi",
         "fig_umap", "fig_geo_cca", "fig_regime_r",
     ]

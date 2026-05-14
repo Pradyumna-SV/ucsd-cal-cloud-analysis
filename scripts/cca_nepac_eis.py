@@ -85,6 +85,9 @@ LON_MIN = float(os.environ.get("LON_MIN", -180.0))
 LON_MAX = float(os.environ.get("LON_MAX", -110.0))
 CF_THRESH = float(os.environ.get("CF_THRESH", 0.4))
 
+# Regress SST out of embeddings before VAE×EIS CCA (and EIS mosaic bins).
+SST_FIXED_EIS = os.environ.get("SST_FIXED_EIS", "0").strip().lower() in ("1", "true", "yes")
+
 WANDB_PROJECT  = os.environ.get("WANDB_PROJECT",  "ucsd-cal-cloud-cca")
 WANDB_RUN_NAME = os.environ.get("WANDB_RUN_NAME", None)
 
@@ -324,6 +327,11 @@ def _match_all_batched(ds, tree, df):
     return outputs
 
 
+def _compute_sst(raw):
+    r = raw["sst_raw"]
+    return np.where(r > 200, r - 273.15, np.nan)
+
+
 def _compute_eis(raw):
     Lv = 2.5e6; Rd = 287.0; Rv = 461.0; cp = 1005.0; g = 9.81
     T700,  T850,  T1000 = raw["T700"],  raw["T850"],  raw["T1000"]
@@ -344,11 +352,18 @@ def _compute_eis(raw):
 def _era5_cache_key(df_meta: pd.DataFrame) -> str:
     times = pd.to_datetime(df_meta["time"], errors="coerce").dropna()
     dates = sorted({f"{t.year:04d}-{t.month:02d}-{t.day:02d}" for t in times})
-    return hashlib.md5("|".join(dates).encode()).hexdigest()
+    raw = (f"bbox={LAT_MIN},{LAT_MAX},{LON_MIN},{LON_MAX}|" + "|".join(dates))
+    return hashlib.md5(raw.encode()).hexdigest()
 
 
-def _save_era5_cache(path: Path, key: str, eis):
-    np.savez_compressed(str(path), _key=np.array([key]), eis=eis)
+def _save_era5_cache(path: Path, key: str, eis, sst=None):
+    np.savez_compressed(
+        str(path),
+        _key     = np.array([key]),
+        eis      = eis,
+        sst      = sst if sst is not None else np.array([np.nan]),
+        _has_sst = np.array([sst is not None]),
+    )
     print(f"  ERA5 cache saved -> {path}")
 
 
@@ -360,21 +375,34 @@ def _load_era5_cache(path: Path, key: str):
         if str(c["_key"][0]) != key:
             print("  ERA5 cache key mismatch — re-matching from GCS.")
             return None
+        eis = c["eis"]
+        if "_has_sst" in c.files:
+            sst = c["sst"] if bool(c["_has_sst"][0]) else None
+        else:
+            sst = None
         print(f"  ERA5 cache HIT  ({path.name})")
-        return c["eis"]
+        return eis, sst
     except Exception as e:
         print(f"  ERA5 cache load error ({e}) — re-matching from GCS.")
         return None
 
 
-# ── CCA (copied verbatim from cca_20yr.py) ───────────────────────────────────
-def run_cca(X, target, lat, months, n_pca, tag=""):
-    valid  = np.isfinite(target)
+# ── CCA (copied from cca_20yr.py; SST optional confound) ─────────────────────
+def run_cca(X, target, lat, months, n_pca, tag="", sst_for_confound=None):
+    valid = np.isfinite(target)
+    if sst_for_confound is not None:
+        valid &= np.isfinite(sst_for_confound)
     X, target, lat, months = X[valid], target[valid], lat[valid], months[valid]
+    if sst_for_confound is not None:
+        sst_c = sst_for_confound[valid].astype("float64")
+    else:
+        sst_c = None
 
     C = np.column_stack([lat, lat**2,
                          np.sin(2 * np.pi * months / 12),
                          np.cos(2 * np.pi * months / 12)])
+    if sst_c is not None:
+        C = np.column_stack([C, sst_c])
     reg      = LinearRegression(fit_intercept=True).fit(C, X)
     X_deconf = X - reg.predict(C)
 
@@ -407,7 +435,7 @@ def run_cca(X, target, lat, months, n_pca, tag=""):
 
 # ── Bin-mosaic walk (copied verbatim from cca_20yr.py) ───────────────────────
 def bin_mosaic_walk(X_vae, var_vals, lat, months, tag, phys_label, out_path,
-                    n_bins=9, n_samples=3, seed=42):
+                    n_bins=9, n_samples=3, seed=42, sst_for_residual=None):
     import sys
     import torch
     sys.path.insert(0, str(Path(__file__).parent))
@@ -420,6 +448,8 @@ def bin_mosaic_walk(X_vae, var_vals, lat, months, tag, phys_label, out_path,
     print(f"  VAE loaded on {device}")
 
     valid = np.isfinite(var_vals)
+    if sst_for_residual is not None:
+        valid &= np.isfinite(sst_for_residual)
     X_v   = X_vae[valid].astype("float32")
     y_v   = var_vals[valid]
     lat_v = lat[valid]
@@ -429,6 +459,8 @@ def bin_mosaic_walk(X_vae, var_vals, lat, months, tag, phys_label, out_path,
     C     = np.column_stack([lat_v, lat_v**2,
                              np.sin(2 * np.pi * mon_v / 12),
                              np.cos(2 * np.pi * mon_v / 12)])
+    if sst_for_residual is not None:
+        C = np.column_stack([C, sst_for_residual[valid].astype("float64")])
     y_res = y_v - LinearRegression(fit_intercept=True).fit(C, y_v).predict(C)
 
     edges = np.percentile(y_res, np.linspace(0, 100, n_bins + 1))
@@ -452,9 +484,10 @@ def bin_mosaic_walk(X_vae, var_vals, lat, months, tag, phys_label, out_path,
     fig, axes = plt.subplots(n_samples, n_bins,
                              figsize=(n_bins * 2.4, n_samples * 2.5),
                              facecolor="#1a1a1a")
+    res_lbl = "lat/season/SST-deconfounded residual" if sst_for_residual is not None else "lat/season-deconfounded residual"
     fig.suptitle(
         f"VAE bin-mosaic walk — {phys_label}  {tag}\n"
-        f"(each panel = individual decoded tile; binned by lat/season-deconfounded residual)",
+        f"(each panel = individual decoded tile; binned by {res_lbl})",
         color="white", fontsize=9, fontweight="bold")
     for col in range(n_bins):
         for row in range(n_samples):
@@ -484,6 +517,7 @@ def main():
             lat_min=LAT_MIN, lat_max=LAT_MAX,
             lon_min=LON_MIN, lon_max=LON_MAX,
             cf_thresh=CF_THRESH,
+            sst_fixed_eis=SST_FIXED_EIS,
             n_pca_vae=N_PCA_VAE,
             n_walk_steps=N_WALK_STEPS,
             n_samples=N_SAMPLES,
@@ -519,32 +553,48 @@ def main():
     print("=" * 60)
     df_meta    = pd.DataFrame({"lat": lat, "lon": lon, "time": times})
     cache_key  = _era5_cache_key(df_meta)
-    cache_path = Path(CACHE_DIR) / "era5_nepac.npz"
-    eis        = _load_era5_cache(cache_path, cache_key)
+    cache_path = Path(CACHE_DIR) / "era5_curated_tiles.npz"
+    cached     = _load_era5_cache(cache_path, cache_key)
+    eis, sst   = (None, None)
+    if cached is not None:
+        eis, sst = cached
+    if SST_FIXED_EIS and sst is None and eis is not None:
+        print("  SST required for SST_FIXED_EIS but missing from cache — re-matching ERA5.")
+        eis, sst = None, None
 
     if eis is None:
         print("Opening ERA5...")
         ds_era5, era5_tree = open_era5()
         print("Matching all ERA5 variables (batched, single pass per day)...")
         raw = _match_all_batched(ds_era5, era5_tree, df_meta)
+        sst = _compute_sst(raw)
         try:
             eis = _compute_eis(raw)
             print(f"  EIS valid: {np.isfinite(eis).sum():,} / {len(eis):,}")
         except Exception as e:
             raise RuntimeError(f"EIS computation failed: {e}")
-        _save_era5_cache(cache_path, cache_key, eis)
+        _save_era5_cache(cache_path, cache_key, eis, sst)
 
     # 4. CCA.
     print("\n" + "=" * 60)
-    print("Step 4 — VAE x EIS CCA (NE Pacific, deconfounded)")
+    print("Step 4 — VAE x EIS CCA (curated tiles, "
+          + ("SST partialled from embeddings" if SST_FIXED_EIS else "lat/season deconfounded")
+          + ")")
     print("=" * 60)
-    pipe = run_cca(X_vae, eis, lat, months, N_PCA_VAE, tag="VAE-EIS-NePac")
+    sst_conf = sst if SST_FIXED_EIS else None
+    pipe = run_cca(X_vae, eis, lat, months, N_PCA_VAE, tag="VAE-EIS-tiles",
+                   sst_for_confound=sst_conf)
 
     results_path = os.path.join(OUT_DIR, "cca_results.txt")
+    deconf_txt = (
+        "lat, lat^2, sin(month), cos(month); VAE×EIS additionally partials SST from embeddings"
+        if SST_FIXED_EIS else "lat, lat^2, sin(month), cos(month)"
+    )
     with open(results_path, "w") as f:
-        f.write("NE-Pacific curated tile CCA results\n")
-        f.write(f"Tiles: {len(tiles):,}  (NE Pac, ocean, daytime, CF>=0.4)\n")
-        f.write(f"Deconfounded by: lat, lat^2, sin(month), cos(month)\n")
+        f.write("Curated-tile MODIS cloud embedding CCA (regional bbox)\n")
+        f.write(f"Tiles: {len(tiles):,}  (bbox, ocean, daytime, CF>={CF_THRESH})\n")
+        f.write(f"Bbox: lat [{LAT_MIN},{LAT_MAX}]  lon [{LON_MIN},{LON_MAX}]\n")
+        f.write(f"Deconfounded by: {deconf_txt}\n")
         f.write(f"r from 20% held-out test set\n\n")
         f.write(f"{'Embedding':<8} {'Target':<6} {'Pearson r':>10} {'Spearman rho':>13}\n")
         f.write("-" * 42 + "\n")
@@ -555,6 +605,8 @@ def main():
     print("\n" + "=" * 60)
     print("Step 5 — Bin-mosaic latent walk (EIS)")
     print("=" * 60)
+    mosaic_name = "walk_mosaic_eis_sstfixed.png" if SST_FIXED_EIS else "walk_mosaic_eis.png"
+    mosaic_path = os.path.join(OUT_DIR, mosaic_name)
     if not os.path.exists(CHECKPOINT):
         print(f"Checkpoint not found at {CHECKPOINT} — skipping mosaic walk.")
     else:
@@ -563,23 +615,26 @@ def main():
             var_vals   = eis,
             lat        = lat,
             months     = months,
-            tag        = "(NE Pacific, curated, ocean+daytime+CF≥0.4)",
+            tag        = f"(curated tiles, CF≥{CF_THRESH})",
             phys_label = "EIS (K)",
-            out_path   = os.path.join(OUT_DIR, "walk_mosaic_eis_nepac.png"),
+            out_path   = mosaic_path,
             n_bins     = N_WALK_STEPS,
             n_samples  = N_SAMPLES,
+            sst_for_residual = sst if SST_FIXED_EIS else None,
         )
 
     # 6. Log to W&B.
     wandb_metrics = {
         "n_tiles":            len(tiles),
         "n_eis_valid":        int(np.isfinite(eis).sum()),
+        "n_sst_valid":        int(np.isfinite(sst).sum()) if sst is not None else 0,
         "VAE_EIS_pearson_r":  pipe["r_pearson"],
         "VAE_EIS_spearman_r": pipe["r_spearman"],
+        "sst_fixed_eis":      int(SST_FIXED_EIS),
     }
-    mosaic_path = os.path.join(OUT_DIR, "walk_mosaic_eis_nepac.png")
     if os.path.exists(mosaic_path):
-        wandb_metrics["walk_mosaic_eis_nepac"] = wandb.Image(mosaic_path)
+        wandb_key = "walk_mosaic_eis_sstfixed" if SST_FIXED_EIS else "walk_mosaic_eis"
+        wandb_metrics[wandb_key] = wandb.Image(mosaic_path)
     wandb.log(wandb_metrics)
     wandb.save(results_path)
     wandb.finish()
