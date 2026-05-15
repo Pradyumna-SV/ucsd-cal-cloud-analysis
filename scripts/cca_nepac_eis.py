@@ -87,6 +87,8 @@ CF_THRESH = float(os.environ.get("CF_THRESH", 0.4))
 
 # Regress SST out of embeddings before VAE×EIS CCA (and EIS mosaic bins).
 SST_FIXED_EIS = os.environ.get("SST_FIXED_EIS", "0").strip().lower() in ("1", "true", "yes")
+# Bin mosaic by CCA latent score along EIS direction (else by EIS residual vs lat/season[/SST]).
+BIN_BY_CCA_SCORE = os.environ.get("BIN_BY_CCA_SCORE", "0").strip().lower() in ("1", "true", "yes")
 
 WANDB_PROJECT  = os.environ.get("WANDB_PROJECT",  "ucsd-cal-cloud-cca")
 WANDB_RUN_NAME = os.environ.get("WANDB_RUN_NAME", None)
@@ -435,7 +437,8 @@ def run_cca(X, target, lat, months, n_pca, tag="", sst_for_confound=None):
 
 # ── Bin-mosaic walk (copied verbatim from cca_20yr.py) ───────────────────────
 def bin_mosaic_walk(X_vae, var_vals, lat, months, tag, phys_label, out_path,
-                    n_bins=9, n_samples=3, seed=42, sst_for_residual=None):
+                    n_bins=9, n_samples=3, seed=42, sst_for_residual=None,
+                    bin_by_cca=False):
     import sys
     import torch
     sys.path.insert(0, str(Path(__file__).parent))
@@ -448,7 +451,7 @@ def bin_mosaic_walk(X_vae, var_vals, lat, months, tag, phys_label, out_path,
     print(f"  VAE loaded on {device}")
 
     valid = np.isfinite(var_vals)
-    if sst_for_residual is not None:
+    if not bin_by_cca and sst_for_residual is not None:
         valid &= np.isfinite(sst_for_residual)
     X_v   = X_vae[valid].astype("float32")
     y_v   = var_vals[valid]
@@ -456,19 +459,26 @@ def bin_mosaic_walk(X_vae, var_vals, lat, months, tag, phys_label, out_path,
     mon_v = months[valid]
     print(f"  [{phys_label}] {valid.sum():,} valid tiles for mosaic walk")
 
-    C     = np.column_stack([lat_v, lat_v**2,
+    if bin_by_cca:
+        y_bin = y_v
+        bin_label = "CCA score (EIS direction)"
+    else:
+        C = np.column_stack([lat_v, lat_v**2,
                              np.sin(2 * np.pi * mon_v / 12),
                              np.cos(2 * np.pi * mon_v / 12)])
-    if sst_for_residual is not None:
-        C = np.column_stack([C, sst_for_residual[valid].astype("float64")])
-    y_res = y_v - LinearRegression(fit_intercept=True).fit(C, y_v).predict(C)
+        if sst_for_residual is not None:
+            C = np.column_stack([C, sst_for_residual[valid].astype("float64")])
+        y_bin = y_v - LinearRegression(fit_intercept=True).fit(C, y_v).predict(C)
+        bin_label = ("lat/season/SST-deconfounded residual"
+                     if sst_for_residual is not None
+                     else "lat/season-deconfounded residual")
 
-    edges = np.percentile(y_res, np.linspace(0, 100, n_bins + 1))
+    edges = np.percentile(y_bin, np.linspace(0, 100, n_bins + 1))
     edges[0] -= 1e-6; edges[-1] += 1e-6
 
     all_tiles, bin_medians, bin_ns = [], [], []
     for i in range(n_bins):
-        mask  = (y_res >= edges[i]) & (y_res < edges[i + 1])
+        mask  = (y_bin >= edges[i]) & (y_bin < edges[i + 1])
         X_bin = X_v[mask]
         k     = min(n_samples, len(X_bin))
         idx   = rng.choice(len(X_bin), size=k, replace=False)
@@ -484,10 +494,9 @@ def bin_mosaic_walk(X_vae, var_vals, lat, months, tag, phys_label, out_path,
     fig, axes = plt.subplots(n_samples, n_bins,
                              figsize=(n_bins * 2.4, n_samples * 2.5),
                              facecolor="#1a1a1a")
-    res_lbl = "lat/season/SST-deconfounded residual" if sst_for_residual is not None else "lat/season-deconfounded residual"
     fig.suptitle(
         f"VAE bin-mosaic walk — {phys_label}  {tag}\n"
-        f"(each panel = individual decoded tile; binned by {res_lbl})",
+        f"(each panel = individual decoded tile; binned by {bin_label})",
         color="white", fontsize=9, fontweight="bold")
     for col in range(n_bins):
         for row in range(n_samples):
@@ -518,6 +527,7 @@ def main():
             lon_min=LON_MIN, lon_max=LON_MAX,
             cf_thresh=CF_THRESH,
             sst_fixed_eis=SST_FIXED_EIS,
+            bin_by_cca_score=BIN_BY_CCA_SCORE,
             n_pca_vae=N_PCA_VAE,
             n_walk_steps=N_WALK_STEPS,
             n_samples=N_SAMPLES,
@@ -605,10 +615,32 @@ def main():
     print("\n" + "=" * 60)
     print("Step 5 — Bin-mosaic latent walk (EIS)")
     print("=" * 60)
-    mosaic_name = "walk_mosaic_eis_sstfixed.png" if SST_FIXED_EIS else "walk_mosaic_eis.png"
+    if BIN_BY_CCA_SCORE:
+        mosaic_name = ("walk_mosaic_eis_ccascore_sstfixed.png" if SST_FIXED_EIS
+                       else "walk_mosaic_eis_ccascore.png")
+    else:
+        mosaic_name = "walk_mosaic_eis_sstfixed.png" if SST_FIXED_EIS else "walk_mosaic_eis.png"
     mosaic_path = os.path.join(OUT_DIR, mosaic_name)
     if not os.path.exists(CHECKPOINT):
         print(f"Checkpoint not found at {CHECKPOINT} — skipping mosaic walk.")
+    elif BIN_BY_CCA_SCORE:
+        vm = pipe["valid_mask"]
+        X_cca = X_vae[vm]
+        assert len(X_cca) == len(pipe["physics_scores"]), \
+            "Mismatch between valid_mask and physics_scores length"
+        bin_mosaic_walk(
+            X_vae           = X_cca,
+            var_vals        = pipe["physics_scores"],
+            lat             = lat[vm],
+            months          = months[vm],
+            tag             = f"(curated tiles, CF≥{CF_THRESH})",
+            phys_label      = "EIS (K)",
+            out_path        = mosaic_path,
+            n_bins          = N_WALK_STEPS,
+            n_samples       = N_SAMPLES,
+            sst_for_residual = None,
+            bin_by_cca      = True,
+        )
     else:
         bin_mosaic_walk(
             X_vae      = X_vae,
@@ -621,6 +653,7 @@ def main():
             n_bins     = N_WALK_STEPS,
             n_samples  = N_SAMPLES,
             sst_for_residual = sst if SST_FIXED_EIS else None,
+            bin_by_cca = False,
         )
 
     # 6. Log to W&B.
@@ -631,9 +664,14 @@ def main():
         "VAE_EIS_pearson_r":  pipe["r_pearson"],
         "VAE_EIS_spearman_r": pipe["r_spearman"],
         "sst_fixed_eis":      int(SST_FIXED_EIS),
+        "bin_by_cca_score":   int(BIN_BY_CCA_SCORE),
     }
     if os.path.exists(mosaic_path):
-        wandb_key = "walk_mosaic_eis_sstfixed" if SST_FIXED_EIS else "walk_mosaic_eis"
+        if BIN_BY_CCA_SCORE:
+            wandb_key = ("walk_mosaic_eis_ccascore_sstfixed" if SST_FIXED_EIS
+                         else "walk_mosaic_eis_ccascore")
+        else:
+            wandb_key = "walk_mosaic_eis_sstfixed" if SST_FIXED_EIS else "walk_mosaic_eis"
         wandb_metrics[wandb_key] = wandb.Image(mosaic_path)
     wandb.log(wandb_metrics)
     wandb.save(results_path)

@@ -25,6 +25,9 @@ spec:
         - name: CHECKPOINT
           value: /workspace/vae_checkpoint/lightning_model_50_transform.pt
 
+        - name: BIN_BY_CCA_SCORE
+          value: "0"
+
         - name: WANDB_PROJECT
           value: "ucsd-cal-cloud-cca"
         - name: WANDB_RUN_NAME
