@@ -1,0 +1,60 @@
+# Interactive shell on your embeddings PVC (no GPU).
+#
+# Usage:
+#   kubectl apply -f jobs/workspace_explore_pod.yaml
+#   kubectl wait -n climate-analytics --for=condition=Ready pod/prad-workspace-explore --timeout=120s
+#   kubectl exec -it -n climate-analytics prad-workspace-explore -- bash
+#
+# Data is at /workspace (same mount as CCA tile jobs).
+# The pod is killed automatically after 10 minutes (activeDeadlineSeconds).
+# Your kubectl exec session will drop when that happens.
+#
+# If you finish early:
+#   kubectl delete pod -n climate-analytics prad-workspace-explore
+#
+# If apply fails because the pod already exists:
+#   kubectl delete pod -n climate-analytics prad-workspace-explore
+#   kubectl apply -f jobs/workspace_explore_pod.yaml
+#
+apiVersion: v1
+kind: Pod
+metadata:
+  name: prad-workspace-explore
+  namespace: climate-analytics
+  labels:
+    app: workspace-explore
+spec:
+  # Terminate the pod 10 minutes after it starts (wall clock), even during kubectl exec.
+  activeDeadlineSeconds: 600
+  restartPolicy: Never
+  containers:
+    - name: shell
+      image: ubuntu:22.04
+      command: ["sleep", "infinity"]
+      resources:
+        requests:
+          cpu: "100m"
+          memory: "256Mi"
+        limits:
+          cpu: "2"
+          memory: "4Gi"
+      volumeMounts:
+        - name: embeddings-storage
+          mountPath: /workspace
+
+  volumes:
+    - name: embeddings-storage
+      persistentVolumeClaim:
+        claimName: prad-embeddings-5ti
+
+  tolerations:
+    - key: "nautilus.io/noceph"
+      operator: Exists
+      effect: NoSchedule
+    - key: "nautilus.io/group"
+      operator: Exists
+      effect: NoSchedule
+    - key: "kubernetes.io/arch"
+      value: "amd64"
+      operator: Equal
+      effect: NoSchedule
