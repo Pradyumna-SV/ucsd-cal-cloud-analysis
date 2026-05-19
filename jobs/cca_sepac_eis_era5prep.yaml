@@ -1,7 +1,7 @@
 apiVersion: batch/v1
 kind: Job
 metadata:
-  name: prad-cca-sepac-eis
+  name: prad-cca-sepac-eis-era5prep
   namespace: climate-analytics
 spec:
   backoffLimit: 0
@@ -10,7 +10,7 @@ spec:
     spec:
       restartPolicy: Never
       containers:
-      - name: cca-nepac-container
+      - name: cca-sepac-era5prep-container
         image: pytorch/pytorch:2.6.0-cuda11.8-cudnn9-devel
 
         env:
@@ -22,25 +22,19 @@ spec:
           value: /workspace/era5_cache/sepac
         - name: WORK_DIR
           value: /workspace/sepac_scratch
-        - name: CHECKPOINT
-          value: /workspace/vae_checkpoint/lightning_model_50_transform.pt
-
-        - name: BIN_BY_CCA_SCORE
-          value: "1"
-        - name: REQUIRE_ERA5_CACHE
+        - name: ERA5_PREP_ONLY
           value: "1"
 
         - name: WANDB_PROJECT
           value: "ucsd-cal-cloud-cca"
         - name: WANDB_RUN_NAME
-          value: "sepac-eis-curated"
+          value: "sepac-eis-era5-prep"
         - name: WANDB_API_KEY
           valueFrom:
             secretKeyRef:
               name: wandb-secret-prad-ccacloud
               key: api-key
 
-        # ── SSH config ───────────────────────────────────────────────────────
         - name: SSH_HOST
           value: "ds-serv8.ucsd.edu"
         - name: SSH_PORT
@@ -53,7 +47,6 @@ spec:
               name: ssh-secret-prad-nepac
               key: password
 
-        # ── Remote data paths — fill these in ───────────────────────────────
         - name: REMOTE_COORD_DIR
           value: "/data/climate-analytics-lab-shared/Satellite/Unsupervised/coordinates_data"
         - name: REMOTE_MYD06_DIR
@@ -61,11 +54,10 @@ spec:
         - name: REMOTE_IMG_DIR
           value: "/data/climate-analytics-lab-shared/Satellite/Unsupervised/triplet_data"
         - name: REMOTE_TMP_DIR
-          value: "/home/sukhanna/tmp"
+          value: "/home/sukhanna/tmp/sepac_era5prep"
         - name: REMOTE_PYTHON
           value: "/home/sukhanna/miniconda3/bin/python"
 
-        # ── Tile filter params ───────────────────────────────────────────────
         - name: REMOTE_N_FILES
           value: "100"
         - name: LAT_MIN
@@ -78,16 +70,6 @@ spec:
           value: "-70.0"
         - name: CF_THRESH
           value: "0.4"
-
-        # ── Analysis hyperparameters ─────────────────────────────────────────
-        - name: N_PCA_VAE
-          value: "50"
-        - name: N_WALK_STEPS
-          value: "9"
-        - name: N_SAMPLES
-          value: "3"
-        - name: VAE_BATCH
-          value: "64"
 
         command: ["/bin/bash", "-c"]
         args:
@@ -107,7 +89,6 @@ spec:
             pip install --quiet \
               numpy pandas scipy scikit-learn \
               xarray zarr gcsfs \
-              pytorch-lightning \
               matplotlib \
               wandb \
               paramiko \
@@ -116,21 +97,20 @@ spec:
 
             mkdir -p /workspace/results/cca_sepac_eis
             mkdir -p /workspace/sepac_scratch
+            mkdir -p /workspace/era5_cache/sepac
             mkdir -p /workspace/logs
 
             {
               python3 $REPO_DIR/scripts/cca_nepac_eis.py
-            } 2>&1 | tee "/workspace/logs/cca_sepac_eis_$(hostname)_$(date +%Y%m%d_%H%M%S).log"
+            } 2>&1 | tee "/workspace/logs/cca_sepac_eis_era5prep_$(hostname)_$(date +%Y%m%d_%H%M%S).log"
 
         resources:
           limits:
             cpu: "8"
             memory: "32Gi"
-            nvidia.com/gpu: "1"
           requests:
             cpu: "8"
             memory: "32Gi"
-            nvidia.com/gpu: "1"
 
         volumeMounts:
         - name: embeddings-storage
@@ -152,34 +132,3 @@ spec:
           value: "amd64"
           operator: Equal
           effect: NoSchedule
-
-      affinity:
-        nodeAffinity:
-          requiredDuringSchedulingIgnoredDuringExecution:
-            nodeSelectorTerms:
-            - matchExpressions:
-              - key: nvidia.com/gpu.product
-                operator: In
-                values:
-                  - NVIDIA-A100-SXM4-80GB
-                  - NVIDIA-A100-80GB-PCIe
-                  - NVIDIA-RTX-A6000
-                  - Quadro-RTX-8000
-                  - NVIDIA-L40
-                  - NVIDIA-A40
-                  - Tesla-V100-SXM2-32GB
-                  - NVIDIA-A10
-                  - NVIDIA-GeForce-RTX-3090
-                  - NVIDIA-GeForce-RTX-4090
-                  - NVIDIA-RTX-A5000
-                  - NVIDIA-TITAN-RTX
-              - key: kubernetes.io/hostname
-                operator: NotIn
-                values:
-                  - sphinx.sdstate.edu
-                  - k8s-haosu-09.sdsc.optiputer.net
-                  - node-2-3.sdsc.optiputer.net
-                  - node-2-2.sdsc.optiputer.net
-                  - node-1-1.sdsc.optiputer.net
-                  - gp-engine.beocat.ksu.edu
-                  - gpengine-uams.areon.net

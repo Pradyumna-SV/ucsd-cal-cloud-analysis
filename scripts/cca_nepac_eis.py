@@ -89,6 +89,10 @@ CF_THRESH = float(os.environ.get("CF_THRESH", 0.4))
 SST_FIXED_EIS = os.environ.get("SST_FIXED_EIS", "0").strip().lower() in ("1", "true", "yes")
 # Bin mosaic by CCA latent score along EIS direction (else by EIS residual vs lat/season[/SST]).
 BIN_BY_CCA_SCORE = os.environ.get("BIN_BY_CCA_SCORE", "0").strip().lower() in ("1", "true", "yes")
+# CPU-only mode: populate ERA5 cache, then exit before VAE/GPU work.
+ERA5_PREP_ONLY = os.environ.get("ERA5_PREP_ONLY", "0").strip().lower() in ("1", "true", "yes")
+# GPU-safety mode: fail instead of matching ERA5 while holding a GPU.
+REQUIRE_ERA5_CACHE = os.environ.get("REQUIRE_ERA5_CACHE", "0").strip().lower() in ("1", "true", "yes")
 
 WANDB_PROJECT  = os.environ.get("WANDB_PROJECT",  "ucsd-cal-cloud-cca")
 WANDB_RUN_NAME = os.environ.get("WANDB_RUN_NAME", None)
@@ -528,6 +532,8 @@ def main():
             cf_thresh=CF_THRESH,
             sst_fixed_eis=SST_FIXED_EIS,
             bin_by_cca_score=BIN_BY_CCA_SCORE,
+            era5_prep_only=ERA5_PREP_ONLY,
+            require_era5_cache=REQUIRE_ERA5_CACHE,
             n_pca_vae=N_PCA_VAE,
             n_walk_steps=N_WALK_STEPS,
             n_samples=N_SAMPLES,
@@ -541,25 +547,18 @@ def main():
     print("=" * 60)
     tiles_path, meta_path = ssh_extract_tiles()
 
-    tiles = np.load(tiles_path)                   # (N, 3, 128, 128) float32
     meta  = np.load(meta_path, allow_pickle=True)
     lat   = meta["lat"].astype("float32")
     lon   = meta["lon"].astype("float32")
     times = pd.to_datetime(meta["time"])
     months = times.month.values.astype("float32")
 
-    print(f"  Loaded {len(tiles):,} tiles  lat[{lat.min():.1f}, {lat.max():.1f}]  "
+    print(f"  Loaded metadata for {len(lat):,} tiles  lat[{lat.min():.1f}, {lat.max():.1f}]  "
           f"lon[{lon.min():.1f}, {lon.max():.1f}]")
 
-    # 2. VAE inference.
+    # 2. ERA5 EIS matching (batched + cached).
     print("\n" + "=" * 60)
-    print("Step 2 — VAE encoder inference")
-    print("=" * 60)
-    X_vae = run_vae_inference(tiles)
-
-    # 3. ERA5 EIS matching (batched + cached).
-    print("\n" + "=" * 60)
-    print("Step 3 — ERA5 EIS matching")
+    print("Step 2 — ERA5 EIS matching")
     print("=" * 60)
     df_meta    = pd.DataFrame({"lat": lat, "lon": lon, "time": times})
     cache_key  = _era5_cache_key(df_meta)
@@ -573,6 +572,10 @@ def main():
         eis, sst = None, None
 
     if eis is None:
+        if REQUIRE_ERA5_CACHE:
+            raise RuntimeError(
+                f"ERA5 cache miss at {cache_path}; run ERA5_PREP_ONLY=1 without a GPU first."
+            )
         print("Opening ERA5...")
         ds_era5, era5_tree = open_era5()
         print("Matching all ERA5 variables (batched, single pass per day)...")
@@ -584,6 +587,26 @@ def main():
         except Exception as e:
             raise RuntimeError(f"EIS computation failed: {e}")
         _save_era5_cache(cache_path, cache_key, eis, sst)
+
+    if ERA5_PREP_ONLY:
+        metrics = {
+            "n_tiles":     len(lat),
+            "n_eis_valid": int(np.isfinite(eis).sum()),
+            "n_sst_valid": int(np.isfinite(sst).sum()) if sst is not None else 0,
+            "era5_prep_only": 1,
+        }
+        wandb.log(metrics)
+        wandb.finish()
+        print("\nERA5 prep complete; exiting before VAE/GPU steps.")
+        return
+
+    # 3. VAE inference.
+    print("\n" + "=" * 60)
+    print("Step 3 — VAE encoder inference")
+    print("=" * 60)
+    tiles = np.load(tiles_path)                   # (N, 3, 128, 128) float32
+    print(f"  Loaded {len(tiles):,} tiles from {tiles_path}")
+    X_vae = run_vae_inference(tiles)
 
     # 4. CCA.
     print("\n" + "=" * 60)

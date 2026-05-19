@@ -19,14 +19,16 @@ spec:
         - name: OUT_DIR
           value: /workspace/results/cca_nepac_eis
         - name: CACHE_DIR
-          value: /workspace/era5_cache
+          value: /workspace/era5_cache/nepac
         - name: WORK_DIR
           value: /workspace/nepac_scratch
         - name: CHECKPOINT
           value: /workspace/vae_checkpoint/lightning_model_50_transform.pt
 
         - name: BIN_BY_CCA_SCORE
-          value: "0"
+          value: "1"
+        - name: REQUIRE_ERA5_CACHE
+          value: "1"
 
         - name: WANDB_PROJECT
           value: "ucsd-cal-cloud-cca"
