@@ -93,6 +93,11 @@ BIN_BY_CCA_SCORE = os.environ.get("BIN_BY_CCA_SCORE", "0").strip().lower() in ("
 ERA5_PREP_ONLY = os.environ.get("ERA5_PREP_ONLY", "0").strip().lower() in ("1", "true", "yes")
 # GPU-safety mode: fail instead of matching ERA5 while holding a GPU.
 REQUIRE_ERA5_CACHE = os.environ.get("REQUIRE_ERA5_CACHE", "0").strip().lower() in ("1", "true", "yes")
+# Publication figure: controlled decoded traversal along learned CCA direction.
+MAKE_HERO_TRAVERSAL = os.environ.get("MAKE_HERO_TRAVERSAL", "1").strip().lower() in ("1", "true", "yes")
+HERO_N_STEPS = int(os.environ.get("HERO_N_STEPS", 7))
+HERO_N_BASES = int(os.environ.get("HERO_N_BASES", 6))
+MAKE_SST_HERO = os.environ.get("MAKE_SST_HERO", "0").strip().lower() in ("1", "true", "yes")
 
 WANDB_PROJECT  = os.environ.get("WANDB_PROJECT",  "ucsd-cal-cloud-cca")
 WANDB_RUN_NAME = os.environ.get("WANDB_RUN_NAME", None)
@@ -521,6 +526,243 @@ def bin_mosaic_walk(X_vae, var_vals, lat, months, tag, phys_label, out_path,
     plt.close()
 
 
+def _tiles_to_rgb(tile_batch):
+    """Convert stored CHW tiles to display-ready RGB in [0, 1]."""
+    arr = np.asarray(tile_batch, dtype="float32")
+    if arr.ndim == 3:
+        arr = arr[None, ...]
+    if arr.shape[1] == 3:
+        arr = arr.transpose(0, 2, 3, 1)
+    finite = arr[np.isfinite(arr)]
+    if finite.size and np.nanmax(finite) > 2.0:
+        arr = arr / 255.0
+    elif finite.size and np.nanmin(finite) < -0.05:
+        arr = (arr + 1.0) / 2.0
+    return np.clip(arr, 0, 1)
+
+
+def _decode_latents(model, device, z, batch_size=64):
+    import torch
+
+    outs = []
+    z = np.asarray(z, dtype="float32")
+    for start in range(0, len(z), batch_size):
+        with torch.no_grad():
+            z_t = torch.tensor(z[start:start + batch_size], dtype=torch.float32).to(device)
+            out = model.decoder(z_t).cpu().numpy()
+        outs.append(out)
+    decoded = np.concatenate(outs, axis=0)
+    return np.clip((decoded + 1) / 2, 0, 1).transpose(0, 2, 3, 1)
+
+
+def _corr_or_nan(a, b):
+    a = np.asarray(a, dtype="float64")
+    b = np.asarray(b, dtype="float64")
+    ok = np.isfinite(a) & np.isfinite(b)
+    if ok.sum() < 3 or np.std(a[ok]) == 0 or np.std(b[ok]) == 0:
+        return np.nan
+    return float(np.corrcoef(a[ok], b[ok])[0, 1])
+
+
+def cca_latent_traversal_hero(X_vae, tiles, pipe, target_vals, aux_sst, lat, months,
+                              tag, target_name, target_units, out_path,
+                              candidates_path, n_steps=7, n_bases=6):
+    """
+    Decode a controlled traversal along the learned CCA direction.
+
+    The direction returned by run_cca lives in standardized deconfounded VAE
+    coordinates. We convert a unit step in that space back to raw VAE latent
+    coordinates before decoding, then ground the generated path with nearest
+    real MODIS tiles.
+    """
+    import sys
+    import torch
+    sys.path.insert(0, str(Path(__file__).parent))
+    from vae import VAELightningModule
+
+    os.makedirs(os.path.dirname(out_path), exist_ok=True)
+    vm = pipe["valid_mask"]
+    X_raw = pipe["X_raw"].astype("float64")
+    X_deconf = pipe["X_deconf"].astype("float64")
+    X_masked = X_vae[vm]
+    target_v = target_vals[vm].astype("float64")
+    sst_v = aux_sst[vm].astype("float64") if aux_sst is not None else None
+    tiles_v = tiles[vm]
+
+    if len(X_raw) != len(X_masked) or len(X_raw) != len(target_v) or len(X_raw) != len(pipe["physics_scores"]):
+        raise ValueError("Hero traversal inputs are not aligned with pipe['valid_mask']")
+
+    scaler = pipe["scaler_X"]
+    X_sc = scaler.transform(X_deconf)
+    direction = np.asarray(pipe["physics_dir"], dtype="float64")
+    direction = direction / np.linalg.norm(direction)
+    scores = np.asarray(pipe["physics_scores"], dtype="float64")
+
+    # Orient the displayed walk so columns move toward higher target values.
+    direction_coord = X_sc @ direction
+    if _corr_or_nan(direction_coord, target_v) < 0:
+        direction *= -1
+        direction_coord *= -1
+    if _corr_or_nan(scores, target_v) < 0:
+        scores *= -1
+
+    n_steps = max(3, int(n_steps))
+    n_bases = max(1, int(n_bases))
+    percentiles = np.array([5, 15, 30, 50, 70, 85, 95], dtype="float64")
+    if n_steps != len(percentiles):
+        percentiles = np.linspace(5, 95, n_steps)
+    target_coords = np.percentile(direction_coord, percentiles)
+    raw_direction = scaler.scale_.astype("float64") * direction
+
+    mid_lo, mid_hi = np.percentile(scores, [40, 60])
+    mid_mask = (scores >= mid_lo) & (scores <= mid_hi)
+    if mid_mask.sum() < n_bases:
+        mid_lo, mid_hi = np.percentile(scores, [30, 70])
+        mid_mask = (scores >= mid_lo) & (scores <= mid_hi)
+    if not np.any(mid_mask):
+        mid_mask = np.ones_like(scores, dtype=bool)
+
+    center = np.median(X_sc[mid_mask], axis=0)
+    pool = np.where(mid_mask)[0]
+    pool_dist = np.linalg.norm(X_sc[pool] - center, axis=1)
+    candidate_idxs = pool[np.argsort(pool_dist)[:min(n_bases, len(pool))]]
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    model = VAELightningModule.load_from_checkpoint(CHECKPOINT)
+    model.to(device).eval()
+    print(f"  Hero traversal VAE loaded on {device}")
+
+    tree = cKDTree(X_raw)
+    candidate_decoded, candidate_walks, candidate_nearest = [], [], []
+    candidate_metrics = []
+    for cand_idx in candidate_idxs:
+        base_coord = float(X_sc[cand_idx] @ direction)
+        deltas = target_coords - base_coord
+        z_walk = X_raw[cand_idx] + np.outer(deltas, raw_direction)
+        nearest_dist, nearest_idx = tree.query(z_walk, k=1)
+        decoded = _decode_latents(model, device, z_walk, batch_size=VAE_BATCH)
+        decoded_base = _decode_latents(model, device, X_raw[cand_idx:cand_idx + 1],
+                                       batch_size=1)[0]
+        real_base = _tiles_to_rgb(tiles_v[cand_idx])[0]
+        recon_mse = float(np.mean((decoded_base - real_base) ** 2))
+        score = float(np.median(nearest_dist) + 0.5 * np.max(nearest_dist) + 50.0 * recon_mse)
+
+        candidate_decoded.append(decoded)
+        candidate_walks.append(z_walk)
+        candidate_nearest.append((nearest_dist, nearest_idx))
+        candidate_metrics.append(dict(
+            cand_idx=int(cand_idx),
+            selection_score=score,
+            recon_mse=recon_mse,
+            nearest_median=float(np.median(nearest_dist)),
+            nearest_max=float(np.max(nearest_dist)),
+        ))
+
+    best_pos = int(np.argmin([m["selection_score"] for m in candidate_metrics]))
+    best_idx = int(candidate_idxs[best_pos])
+    decoded_best = candidate_decoded[best_pos]
+    nearest_dist, nearest_idx = candidate_nearest[best_pos]
+
+    edges = np.percentile(direction_coord, np.linspace(0, 100, n_steps + 1))
+    medoid_idx, bin_target_median, bin_sst_median, bin_n = [], [], [], []
+    for col in range(n_steps):
+        lo, hi = edges[col], edges[col + 1]
+        if col == n_steps - 1:
+            mask = (direction_coord >= lo) & (direction_coord <= hi)
+        else:
+            mask = (direction_coord >= lo) & (direction_coord < hi)
+        if not np.any(mask):
+            idx = int(np.argmin(np.abs(direction_coord - target_coords[col])))
+            mask = np.zeros_like(direction_coord, dtype=bool)
+            mask[idx] = True
+        group = np.where(mask)[0]
+        group_center = np.median(X_sc[group], axis=0)
+        idx = int(group[np.argmin(np.linalg.norm(X_sc[group] - group_center, axis=1))])
+        medoid_idx.append(idx)
+        bin_target_median.append(float(np.nanmedian(target_v[group])))
+        bin_sst_median.append(float(np.nanmedian(sst_v[group])) if sst_v is not None else np.nan)
+        bin_n.append(int(len(group)))
+    medoid_idx = np.array(medoid_idx, dtype=int)
+
+    nearest_tiles = _tiles_to_rgb(tiles_v[nearest_idx])
+    medoid_tiles = _tiles_to_rgb(tiles_v[medoid_idx])
+
+    fig, axes = plt.subplots(3, n_steps, figsize=(n_steps * 2.15, 7.3),
+                             facecolor="#111111")
+    axes = np.asarray(axes).reshape(3, n_steps)
+    row_labels = ["Decoded\nCCA walk", "Nearest\nobserved", "Bin\nmedoid"]
+    for col in range(n_steps):
+        imgs = [decoded_best[col], nearest_tiles[col], medoid_tiles[col]]
+        for row in range(3):
+            ax = axes[row, col]
+            ax.imshow(imgs[row])
+            ax.set_xticks([]); ax.set_yticks([])
+            for sp in ax.spines.values():
+                sp.set_edgecolor("#555")
+            if col == 0:
+                ax.set_ylabel(row_labels[row], color="white", fontsize=9,
+                              fontweight="bold", rotation=0, labelpad=34, va="center")
+        sst_txt = f"\nSST {bin_sst_median[col]:.1f}C" if np.isfinite(bin_sst_median[col]) else ""
+        axes[0, col].set_title(
+            f"p{percentiles[col]:.0f}\n{target_name} {bin_target_median[col]:.1f}{target_units}{sst_txt}",
+            color="white", fontsize=8, pad=4)
+        axes[2, col].set_xlabel(f"n={bin_n[col]:,}", color="#aaa", fontsize=7)
+
+    corr_txt = _corr_or_nan(direction_coord, target_v)
+    fig.suptitle(
+        f"VAE morphology traversal along learned {target_name} direction  {tag}\n"
+        f"base={best_idx}  r(direction,{target_name})={corr_txt:.2f}  "
+        f"filters: ocean, daytime, CF≥{CF_THRESH}"
+        + ("  SST-controlled" if SST_FIXED_EIS else ""),
+        color="white", fontsize=10, fontweight="bold")
+    plt.tight_layout(rect=[0, 0.02, 1, 0.88])
+    plt.savefig(out_path, dpi=180, bbox_inches="tight", facecolor="#111111")
+    print(f"  Saved hero traversal -> {out_path}")
+    plt.close()
+
+    fig, axes = plt.subplots(len(candidate_idxs), n_steps,
+                             figsize=(n_steps * 1.8, len(candidate_idxs) * 1.75),
+                             facecolor="#111111")
+    axes = np.asarray(axes).reshape(len(candidate_idxs), n_steps)
+    for row, metric in enumerate(candidate_metrics):
+        for col in range(n_steps):
+            ax = axes[row, col]
+            ax.imshow(candidate_decoded[row][col])
+            ax.set_xticks([]); ax.set_yticks([])
+            for sp in ax.spines.values():
+                sp.set_edgecolor("#555")
+            if row == 0:
+                ax.set_title(f"p{percentiles[col]:.0f}", color="white", fontsize=8)
+            if col == 0:
+                ax.set_ylabel(
+                    f"base {metric['cand_idx']}\nscore {metric['selection_score']:.1f}",
+                    color="white", fontsize=7, rotation=0, labelpad=36, va="center")
+    fig.suptitle(
+        f"Candidate decoded {target_name} traversals  {tag}\n"
+        "lower score = closer to observed latent manifold + better base reconstruction",
+        color="white", fontsize=9, fontweight="bold")
+    plt.tight_layout(rect=[0, 0.02, 1, 0.88])
+    plt.savefig(candidates_path, dpi=160, bbox_inches="tight", facecolor="#111111")
+    print(f"  Saved hero candidates -> {candidates_path}")
+    plt.close()
+
+    metrics = {
+        "hero_best_base_index": best_idx,
+        "hero_best_selection_score": candidate_metrics[best_pos]["selection_score"],
+        "hero_base_recon_mse": candidate_metrics[best_pos]["recon_mse"],
+        "hero_nearest_latent_distance_median": float(np.median(nearest_dist)),
+        "hero_nearest_latent_distance_max": float(np.max(nearest_dist)),
+        "hero_direction_target_corr": corr_txt,
+        "hero_score_percentile_min": float(percentiles.min()),
+        "hero_score_percentile_max": float(percentiles.max()),
+    }
+    return dict(
+        hero_path=out_path,
+        candidates_path=candidates_path,
+        metrics=metrics,
+    )
+
+
 # ── Main ─────────────────────────────────────────────────────────────────────
 def main():
     wandb.init(
@@ -534,6 +776,10 @@ def main():
             bin_by_cca_score=BIN_BY_CCA_SCORE,
             era5_prep_only=ERA5_PREP_ONLY,
             require_era5_cache=REQUIRE_ERA5_CACHE,
+            make_hero_traversal=MAKE_HERO_TRAVERSAL,
+            hero_n_steps=HERO_N_STEPS,
+            hero_n_bases=HERO_N_BASES,
+            make_sst_hero=MAKE_SST_HERO,
             n_pca_vae=N_PCA_VAE,
             n_walk_steps=N_WALK_STEPS,
             n_samples=N_SAMPLES,
@@ -634,9 +880,65 @@ def main():
         f.write(f"{'VAE':<8} {'EIS':<6} {pipe['r_pearson']:>10.4f} {pipe['r_spearman']:>13.4f}\n")
     print(f"\nResults saved -> {results_path}")
 
-    # 5. Bin-mosaic walk.
+    hero_images = {}
+    hero_metrics = {}
+
+    # 5. Controlled hero traversal.
     print("\n" + "=" * 60)
-    print("Step 5 — Bin-mosaic latent walk (EIS)")
+    print("Step 5 — Controlled CCA latent traversal hero")
+    print("=" * 60)
+    if MAKE_HERO_TRAVERSAL and os.path.exists(CHECKPOINT):
+        hero_eis = cca_latent_traversal_hero(
+            X_vae           = X_vae,
+            tiles           = tiles,
+            pipe            = pipe,
+            target_vals     = eis,
+            aux_sst         = sst,
+            lat             = lat,
+            months          = months,
+            tag             = f"(curated tiles, CF≥{CF_THRESH})",
+            target_name     = "EIS",
+            target_units    = " K",
+            out_path        = os.path.join(OUT_DIR, "hero_cca_traversal_eis.png"),
+            candidates_path = os.path.join(OUT_DIR, "hero_cca_traversal_candidates_eis.png"),
+            n_steps         = HERO_N_STEPS,
+            n_bases         = HERO_N_BASES,
+        )
+        hero_images["hero_cca_traversal_eis"] = hero_eis["hero_path"]
+        hero_images["hero_cca_traversal_candidates_eis"] = hero_eis["candidates_path"]
+        hero_metrics.update(hero_eis["metrics"])
+
+        if MAKE_SST_HERO and sst is not None and np.isfinite(sst).sum() > 10:
+            print("\nStep 5b — Optional SST latent traversal companion")
+            pipe_sst = run_cca(X_vae, sst, lat, months, N_PCA_VAE, tag="VAE-SST-tiles",
+                               sst_for_confound=None)
+            hero_sst = cca_latent_traversal_hero(
+                X_vae           = X_vae,
+                tiles           = tiles,
+                pipe            = pipe_sst,
+                target_vals     = sst,
+                aux_sst         = None,
+                lat             = lat,
+                months          = months,
+                tag             = f"(curated tiles, CF≥{CF_THRESH})",
+                target_name     = "SST",
+                target_units    = " C",
+                out_path        = os.path.join(OUT_DIR, "hero_cca_traversal_sst.png"),
+                candidates_path = os.path.join(OUT_DIR, "hero_cca_traversal_candidates_sst.png"),
+                n_steps         = HERO_N_STEPS,
+                n_bases         = HERO_N_BASES,
+            )
+            hero_images["hero_cca_traversal_sst"] = hero_sst["hero_path"]
+            hero_images["hero_cca_traversal_candidates_sst"] = hero_sst["candidates_path"]
+            hero_metrics.update({f"sst_{k}": v for k, v in hero_sst["metrics"].items()})
+    elif MAKE_HERO_TRAVERSAL:
+        print(f"Checkpoint not found at {CHECKPOINT} — skipping hero traversal.")
+    else:
+        print("MAKE_HERO_TRAVERSAL disabled — skipping hero traversal.")
+
+    # 6. Bin-mosaic walk.
+    print("\n" + "=" * 60)
+    print("Step 6 — Bin-mosaic latent walk (EIS)")
     print("=" * 60)
     if BIN_BY_CCA_SCORE:
         mosaic_name = ("walk_mosaic_eis_ccascore_sstfixed.png" if SST_FIXED_EIS
@@ -679,7 +981,7 @@ def main():
             bin_by_cca = False,
         )
 
-    # 6. Log to W&B.
+    # 7. Log to W&B.
     wandb_metrics = {
         "n_tiles":            len(tiles),
         "n_eis_valid":        int(np.isfinite(eis).sum()),
@@ -689,6 +991,10 @@ def main():
         "sst_fixed_eis":      int(SST_FIXED_EIS),
         "bin_by_cca_score":   int(BIN_BY_CCA_SCORE),
     }
+    wandb_metrics.update(hero_metrics)
+    for key, path in hero_images.items():
+        if os.path.exists(path):
+            wandb_metrics[key] = wandb.Image(path)
     if os.path.exists(mosaic_path):
         if BIN_BY_CCA_SCORE:
             wandb_key = ("walk_mosaic_eis_ccascore_sstfixed" if SST_FIXED_EIS

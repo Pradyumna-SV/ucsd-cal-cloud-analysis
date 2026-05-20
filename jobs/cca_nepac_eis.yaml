@@ -29,6 +29,14 @@ spec:
           value: "1"
         - name: REQUIRE_ERA5_CACHE
           value: "1"
+        - name: MAKE_HERO_TRAVERSAL
+          value: "1"
+        - name: HERO_N_STEPS
+          value: "7"
+        - name: HERO_N_BASES
+          value: "6"
+        - name: MAKE_SST_HERO
+          value: "0"
 
         - name: WANDB_PROJECT
           value: "ucsd-cal-cloud-cca"
