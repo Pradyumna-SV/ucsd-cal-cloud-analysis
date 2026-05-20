@@ -534,18 +534,56 @@ def bin_mosaic_walk(X_vae, var_vals, lat, months, tag, phys_label, out_path,
 
 
 def _tiles_to_rgb(tile_batch):
-    """Convert stored CHW tiles to display-ready RGB in [0, 1]."""
+    """Convert stored CHW tiles to contrast-stretched display RGB in [0, 1]."""
     arr = np.asarray(tile_batch, dtype="float32")
     if arr.ndim == 3:
         arr = arr[None, ...]
     if arr.shape[1] == 3:
         arr = arr.transpose(0, 2, 3, 1)
+    arr = np.nan_to_num(arr, nan=0.0, posinf=0.0, neginf=0.0)
+
     finite = arr[np.isfinite(arr)]
     if finite.size and np.nanmax(finite) > 2.0:
         arr = arr / 255.0
     elif finite.size and np.nanmin(finite) < -0.05:
         arr = (arr + 1.0) / 2.0
-    return np.clip(arr, 0, 1)
+
+    # The MODIS memmap channels can have tiny absolute dynamic range. For
+    # display panels, stretch each tile independently so real cloud texture is
+    # visible instead of rendering as black.
+    out = np.empty_like(arr, dtype="float32")
+    for i, img in enumerate(arr):
+        vals = img[np.isfinite(img)]
+        if vals.size == 0:
+            out[i] = 0
+            continue
+        lo, hi = np.percentile(vals, [1, 99])
+        if not np.isfinite(lo) or not np.isfinite(hi) or hi <= lo + 1e-8:
+            lo, hi = float(np.nanmin(vals)), float(np.nanmax(vals))
+        if hi <= lo + 1e-8:
+            out[i] = np.clip(img, 0, 1)
+        else:
+            out[i] = (img - lo) / (hi - lo)
+    return np.clip(out, 0, 1)
+
+
+def _tile_value_metrics(tiles):
+    vals = np.asarray(tiles, dtype="float32")
+    finite = vals[np.isfinite(vals)]
+    if finite.size == 0:
+        return {}
+    qs = np.percentile(finite, [0, 1, 5, 50, 95, 99, 100])
+    return {
+        "tile_value_min": float(qs[0]),
+        "tile_value_p01": float(qs[1]),
+        "tile_value_p05": float(qs[2]),
+        "tile_value_p50": float(qs[3]),
+        "tile_value_p95": float(qs[4]),
+        "tile_value_p99": float(qs[5]),
+        "tile_value_max": float(qs[6]),
+        "tile_value_mean": float(np.mean(finite)),
+        "tile_value_std": float(np.std(finite)),
+    }
 
 
 def _decode_latents(model, device, z, batch_size=64):
@@ -719,7 +757,7 @@ def cca_latent_traversal_hero(X_vae, tiles, pipe, target_vals, aux_sst, lat, mon
     fig.suptitle(
         f"VAE morphology traversal along learned {target_name} direction  {tag}\n"
         f"base={best_idx}  r(direction,{target_name})={corr_txt:.2f}  "
-        f"filters: ocean, daytime, CF≥{CF_THRESH}"
+        f"filters: ocean, daytime, CF≥{CF_THRESH}; observed rows contrast-stretched"
         + ("  SST-controlled" if SST_FIXED_EIS else ""),
         color="white", fontsize=10, fontweight="bold")
     plt.tight_layout(rect=[0, 0.02, 1, 0.88])
@@ -923,7 +961,7 @@ def prototype_interpolation_hero(X_vae, tiles, score_vals, target_vals, aux_sst,
 
     fig.suptitle(
         f"VAE-decoded cloud morphology continuum ordered by {score_name}  {tag}\n"
-        "low prototype -> mid prototype -> high prototype; anchors are real cloudy ocean MODIS tiles",
+        "low prototype -> mid prototype -> high prototype; observed rows are contrast-stretched real MODIS tiles",
         color="white", fontsize=10, fontweight="bold")
     plt.tight_layout(rect=[0, 0.02, 1, 0.88])
     plt.savefig(out_path, dpi=180, bbox_inches="tight", facecolor="#111111")
@@ -1062,7 +1100,7 @@ def morphology_atlas_hero(X_vae, tiles, score_vals, target_vals, aux_sst, tag,
         observed,
         observed_path,
         f"Observed MODIS medoids underlying the VAE morphology atlas  {tag}\n"
-        "same manifold cells as decoded atlas",
+        "same manifold cells as decoded atlas; observed panels are per-tile contrast-stretched",
         "Morphology",
     )
 
@@ -1172,6 +1210,14 @@ def main():
     print("=" * 60)
     tiles = np.load(tiles_path)                   # (N, 3, 128, 128) float32
     print(f"  Loaded {len(tiles):,} tiles from {tiles_path}")
+    tile_metrics = _tile_value_metrics(tiles)
+    if tile_metrics:
+        print("  Tile value range: "
+              f"min={tile_metrics['tile_value_min']:.4g} "
+              f"p01={tile_metrics['tile_value_p01']:.4g} "
+              f"p50={tile_metrics['tile_value_p50']:.4g} "
+              f"p99={tile_metrics['tile_value_p99']:.4g} "
+              f"max={tile_metrics['tile_value_max']:.4g}")
     X_vae = run_vae_inference(tiles)
 
     # 4. CCA.
@@ -1388,6 +1434,7 @@ def main():
         "sst_fixed_eis":      int(SST_FIXED_EIS),
         "bin_by_cca_score":   int(BIN_BY_CCA_SCORE),
     }
+    wandb_metrics.update(tile_metrics)
     wandb_metrics.update(hero_metrics)
     for key, path in hero_images.items():
         if os.path.exists(path):
