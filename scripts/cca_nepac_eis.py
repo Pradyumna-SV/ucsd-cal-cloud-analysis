@@ -98,6 +98,9 @@ MAKE_HERO_TRAVERSAL = os.environ.get("MAKE_HERO_TRAVERSAL", "1").strip().lower()
 HERO_N_STEPS = int(os.environ.get("HERO_N_STEPS", 7))
 HERO_N_BASES = int(os.environ.get("HERO_N_BASES", 6))
 MAKE_SST_HERO = os.environ.get("MAKE_SST_HERO", "0").strip().lower() in ("1", "true", "yes")
+# On-manifold decoder figure: interpolate between real environmental prototypes.
+MAKE_PROTO_INTERP = os.environ.get("MAKE_PROTO_INTERP", "1").strip().lower() in ("1", "true", "yes")
+PROTO_N_STEPS = int(os.environ.get("PROTO_N_STEPS", 9))
 
 WANDB_PROJECT  = os.environ.get("WANDB_PROJECT",  "ucsd-cal-cloud-cca")
 WANDB_RUN_NAME = os.environ.get("WANDB_RUN_NAME", None)
@@ -763,6 +766,179 @@ def cca_latent_traversal_hero(X_vae, tiles, pipe, target_vals, aux_sst, lat, mon
     )
 
 
+def _visual_quality_scores(tile_batch):
+    """Rank tiles for visible cloud texture/contrast using only the displayed pixels."""
+    rgb = _tiles_to_rgb(tile_batch)
+    lum = rgb.mean(axis=3)
+    mean = lum.mean(axis=(1, 2))
+    std = lum.std(axis=(1, 2))
+    p05 = np.percentile(lum, 5, axis=(1, 2))
+    p95 = np.percentile(lum, 95, axis=(1, 2))
+    contrast = p95 - p05
+    grad_x = np.abs(np.diff(lum, axis=2)).mean(axis=(1, 2))
+    grad_y = np.abs(np.diff(lum, axis=1)).mean(axis=(1, 2))
+    texture = grad_x + grad_y
+    saturation = (rgb.max(axis=3) - rgb.min(axis=3)).mean(axis=(1, 2))
+
+    score = 1.8 * std + 1.3 * contrast + 8.0 * texture + 0.5 * saturation
+    score -= np.maximum(0, 0.18 - mean) * 2.0
+    score -= np.maximum(0, mean - 0.86) * 2.0
+    score -= np.maximum(0, 0.08 - std) * 3.0
+    return score.astype("float64")
+
+
+def _choose_quality_medoid(X_sc, tiles_rgb, idxs):
+    idxs = np.asarray(idxs, dtype=int)
+    center = np.median(X_sc[idxs], axis=0)
+    dist = np.linalg.norm(X_sc[idxs] - center, axis=1)
+    quality = _visual_quality_scores(tiles_rgb[idxs])
+
+    dist_z = (dist - np.median(dist)) / (np.std(dist) + 1e-6)
+    quality_z = (quality - np.median(quality)) / (np.std(quality) + 1e-6)
+    # Favor representative latents, but require visually informative cloud texture.
+    rank = dist_z - 0.8 * quality_z
+    return int(idxs[np.argmin(rank)])
+
+
+def prototype_interpolation_hero(X_vae, tiles, score_vals, target_vals, aux_sst,
+                                 tag, score_name, score_units, target_name,
+                                 target_units, out_path, n_steps=9):
+    """
+    Decode a continuous interpolation between real prototype cloud latents.
+
+    Unlike directional extrapolation, every point lies between real observed
+    latents selected from low/mid/high environmental bins.
+    """
+    import sys
+    import torch
+    sys.path.insert(0, str(Path(__file__).parent))
+    from vae import VAELightningModule
+
+    os.makedirs(os.path.dirname(out_path), exist_ok=True)
+    valid = np.isfinite(score_vals) & np.isfinite(target_vals)
+    if aux_sst is not None:
+        valid &= np.isfinite(aux_sst)
+    X = X_vae[valid].astype("float64")
+    score = score_vals[valid].astype("float64")
+    target = target_vals[valid].astype("float64")
+    sst_v = aux_sst[valid].astype("float64") if aux_sst is not None else None
+    tiles_v = tiles[valid]
+
+    if len(X) < 30:
+        raise ValueError(f"Not enough valid tiles for {score_name} prototype interpolation")
+
+    if _corr_or_nan(score, target) < 0:
+        score *= -1
+
+    X_sc = StandardScaler().fit_transform(X)
+    bins = [(5, 25), (40, 60), (75, 95)]
+    anchor_idxs, anchor_stats = [], []
+    for lo, hi in bins:
+        qlo, qhi = np.percentile(score, [lo, hi])
+        mask = (score >= qlo) & (score <= qhi)
+        if mask.sum() < 5:
+            center_q = (lo + hi) / 2
+            qlo, qhi = np.percentile(score, [max(0, center_q - 20), min(100, center_q + 20)])
+            mask = (score >= qlo) & (score <= qhi)
+        idxs = np.where(mask)[0]
+        if len(idxs) == 0:
+            idxs = np.array([int(np.argmin(np.abs(score - np.percentile(score, (lo + hi) / 2))))])
+        anchor = _choose_quality_medoid(X_sc, tiles_v, idxs)
+        anchor_idxs.append(anchor)
+        anchor_stats.append(dict(
+            q_lo=lo, q_hi=hi, n=int(len(idxs)),
+            score=float(np.nanmedian(score[idxs])),
+            target=float(np.nanmedian(target[idxs])),
+            sst=float(np.nanmedian(sst_v[idxs])) if sst_v is not None else np.nan,
+        ))
+
+    low, mid, high = anchor_idxs
+    n_steps = max(5, int(n_steps))
+    left_n = n_steps // 2 + 1
+    right_n = n_steps - left_n + 1
+    left = np.array([(1 - a) * X[low] + a * X[mid] for a in np.linspace(0, 1, left_n)])
+    right = np.array([(1 - a) * X[mid] + a * X[high] for a in np.linspace(0, 1, right_n)[1:]])
+    z_path = np.vstack([left, right]).astype("float32")
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    model = VAELightningModule.load_from_checkpoint(CHECKPOINT)
+    model.to(device).eval()
+    print(f"  Prototype interpolation VAE loaded on {device}")
+
+    decoded = _decode_latents(model, device, z_path, batch_size=VAE_BATCH)
+    tree = cKDTree(X)
+    nearest_dist, nearest_idx = tree.query(z_path, k=1)
+    nearest_tiles = _tiles_to_rgb(tiles_v[nearest_idx])
+    anchor_tiles = _tiles_to_rgb(tiles_v[anchor_idxs])
+
+    interp_pos = np.r_[np.linspace(0, 0.5, left_n), np.linspace(0.5, 1, right_n)[1:]]
+    interp_score = np.interp(interp_pos, [0, 0.5, 1],
+                             [anchor_stats[0]["score"], anchor_stats[1]["score"], anchor_stats[2]["score"]])
+    interp_target = np.interp(interp_pos, [0, 0.5, 1],
+                              [anchor_stats[0]["target"], anchor_stats[1]["target"], anchor_stats[2]["target"]])
+
+    fig, axes = plt.subplots(3, n_steps, figsize=(n_steps * 2.05, 7.1),
+                             facecolor="#111111")
+    axes = np.asarray(axes).reshape(3, n_steps)
+    row_labels = ["Decoded\ncontinuum", "Nearest\nobserved", "Observed\nanchors"]
+    anchor_cols = {0: 0, left_n - 1: 1, n_steps - 1: 2}
+    for col in range(n_steps):
+        imgs = [decoded[col], nearest_tiles[col], None]
+        for row in range(3):
+            ax = axes[row, col]
+            if row == 2:
+                if col in anchor_cols:
+                    ax.imshow(anchor_tiles[anchor_cols[col]])
+                    for sp in ax.spines.values():
+                        sp.set_edgecolor("#dddddd")
+                        sp.set_linewidth(1.5)
+                else:
+                    ax.set_facecolor("#111111")
+                    ax.text(0.5, 0.5, "interpolation", color="#777777",
+                            fontsize=7, ha="center", va="center", transform=ax.transAxes)
+                    for sp in ax.spines.values():
+                        sp.set_edgecolor("#333333")
+            else:
+                ax.imshow(imgs[row])
+                for sp in ax.spines.values():
+                    sp.set_edgecolor("#555555")
+            ax.set_xticks([]); ax.set_yticks([])
+            if col == 0:
+                ax.set_ylabel(row_labels[row], color="white", fontsize=9,
+                              fontweight="bold", rotation=0, labelpad=34, va="center")
+
+        sst_txt = ""
+        if sst_v is not None:
+            nearest_sst = sst_v[nearest_idx[col]]
+            sst_txt = f"\nSST {nearest_sst:.1f}C"
+        axes[0, col].set_title(
+            f"{score_name} {interp_score[col]:.2f}{score_units}\n"
+            f"{target_name} {interp_target[col]:.1f}{target_units}{sst_txt}",
+            color="white", fontsize=7, pad=4)
+        axes[1, col].set_xlabel(f"d={nearest_dist[col]:.1f}", color="#aaaaaa", fontsize=7)
+
+    fig.suptitle(
+        f"VAE-decoded cloud morphology continuum ordered by {score_name}  {tag}\n"
+        "low prototype -> mid prototype -> high prototype; anchors are real cloudy ocean MODIS tiles",
+        color="white", fontsize=10, fontweight="bold")
+    plt.tight_layout(rect=[0, 0.02, 1, 0.88])
+    plt.savefig(out_path, dpi=180, bbox_inches="tight", facecolor="#111111")
+    print(f"  Saved prototype interpolation -> {out_path}")
+    plt.close()
+
+    metric_prefix = re.sub(r"[^a-z0-9]+", "_", score_name.lower()).strip("_")
+    return dict(
+        path=out_path,
+        metrics={
+            f"proto_{metric_prefix}_nearest_distance_median": float(np.median(nearest_dist)),
+            f"proto_{metric_prefix}_nearest_distance_max": float(np.max(nearest_dist)),
+            f"proto_{metric_prefix}_low_anchor": int(low),
+            f"proto_{metric_prefix}_mid_anchor": int(mid),
+            f"proto_{metric_prefix}_high_anchor": int(high),
+        },
+    )
+
+
 # ── Main ─────────────────────────────────────────────────────────────────────
 def main():
     wandb.init(
@@ -780,6 +956,8 @@ def main():
             hero_n_steps=HERO_N_STEPS,
             hero_n_bases=HERO_N_BASES,
             make_sst_hero=MAKE_SST_HERO,
+            make_proto_interp=MAKE_PROTO_INTERP,
+            proto_n_steps=PROTO_N_STEPS,
             n_pca_vae=N_PCA_VAE,
             n_walk_steps=N_WALK_STEPS,
             n_samples=N_SAMPLES,
@@ -935,6 +1113,53 @@ def main():
         print(f"Checkpoint not found at {CHECKPOINT} — skipping hero traversal.")
     else:
         print("MAKE_HERO_TRAVERSAL disabled — skipping hero traversal.")
+
+    # 5c. On-manifold prototype interpolation hero candidates.
+    print("\n" + "=" * 60)
+    print("Step 5c — Prototype latent interpolation heroes")
+    print("=" * 60)
+    if MAKE_PROTO_INTERP and os.path.exists(CHECKPOINT):
+        proto_eis = prototype_interpolation_hero(
+            X_vae        = X_vae,
+            tiles        = tiles,
+            score_vals   = eis,
+            target_vals  = eis,
+            aux_sst      = sst,
+            tag          = f"(curated tiles, CF≥{CF_THRESH})",
+            score_name   = "EIS",
+            score_units  = " K",
+            target_name  = "EIS",
+            target_units = " K",
+            out_path     = os.path.join(OUT_DIR, "hero_proto_interp_eis.png"),
+            n_steps      = PROTO_N_STEPS,
+        )
+        hero_images["hero_proto_interp_eis"] = proto_eis["path"]
+        hero_metrics.update(proto_eis["metrics"])
+
+        vm = pipe["valid_mask"]
+        scores = pipe["physics_scores"]
+        if len(X_vae[vm]) != len(scores):
+            raise ValueError("Prototype CCA-score inputs are not aligned with pipe['valid_mask']")
+        proto_cca = prototype_interpolation_hero(
+            X_vae        = X_vae[vm],
+            tiles        = tiles[vm],
+            score_vals   = scores,
+            target_vals  = eis[vm],
+            aux_sst      = sst[vm] if sst is not None else None,
+            tag          = f"(curated tiles, CF≥{CF_THRESH})",
+            score_name   = "CCA score",
+            score_units  = "",
+            target_name  = "EIS",
+            target_units = " K",
+            out_path     = os.path.join(OUT_DIR, "hero_proto_interp_ccascore.png"),
+            n_steps      = PROTO_N_STEPS,
+        )
+        hero_images["hero_proto_interp_ccascore"] = proto_cca["path"]
+        hero_metrics.update(proto_cca["metrics"])
+    elif MAKE_PROTO_INTERP:
+        print(f"Checkpoint not found at {CHECKPOINT} — skipping prototype interpolation heroes.")
+    else:
+        print("MAKE_PROTO_INTERP disabled — skipping prototype interpolation heroes.")
 
     # 6. Bin-mosaic walk.
     print("\n" + "=" * 60)
