@@ -101,6 +101,10 @@ MAKE_SST_HERO = os.environ.get("MAKE_SST_HERO", "0").strip().lower() in ("1", "t
 # On-manifold decoder figure: interpolate between real environmental prototypes.
 MAKE_PROTO_INTERP = os.environ.get("MAKE_PROTO_INTERP", "1").strip().lower() in ("1", "true", "yes")
 PROTO_N_STEPS = int(os.environ.get("PROTO_N_STEPS", 9))
+# 2D morphology atlas: decoded medoids over environment score x latent morphology.
+MAKE_MORPH_ATLAS = os.environ.get("MAKE_MORPH_ATLAS", "0").strip().lower() in ("1", "true", "yes")
+ATLAS_N_COLS = int(os.environ.get("ATLAS_N_COLS", 6))
+ATLAS_N_ROWS = int(os.environ.get("ATLAS_N_ROWS", 5))
 
 WANDB_PROJECT  = os.environ.get("WANDB_PROJECT",  "ucsd-cal-cloud-cca")
 WANDB_RUN_NAME = os.environ.get("WANDB_RUN_NAME", None)
@@ -939,6 +943,141 @@ def prototype_interpolation_hero(X_vae, tiles, score_vals, target_vals, aux_sst,
     )
 
 
+def morphology_atlas_hero(X_vae, tiles, score_vals, target_vals, aux_sst, tag,
+                          score_name, target_name, target_units,
+                          decoded_path, observed_path, n_cols=6, n_rows=5):
+    """
+    Build a 2D VAE morphology atlas from real medoid latents.
+
+    Columns follow the environmental/VAE-CCA score. Rows span the strongest
+    residual latent morphology axis after removing that score. Every decoded
+    panel is the decoder output for a real observed medoid latent, so the atlas
+    stays on the VAE data manifold.
+    """
+    import sys
+    import torch
+    sys.path.insert(0, str(Path(__file__).parent))
+    from vae import VAELightningModule
+
+    valid = np.isfinite(score_vals) & np.isfinite(target_vals)
+    if aux_sst is not None:
+        valid &= np.isfinite(aux_sst)
+    X = X_vae[valid].astype("float64")
+    score = score_vals[valid].astype("float64")
+    target = target_vals[valid].astype("float64")
+    sst_v = aux_sst[valid].astype("float64") if aux_sst is not None else None
+    tiles_v = tiles[valid]
+    if len(X) < max(50, n_cols * n_rows):
+        raise ValueError(f"Not enough valid tiles for {score_name} morphology atlas")
+
+    if _corr_or_nan(score, target) < 0:
+        score *= -1
+
+    n_cols = max(3, int(n_cols))
+    n_rows = max(3, int(n_rows))
+    X_sc = StandardScaler().fit_transform(X)
+    score_z = (score - np.nanmean(score)) / (np.nanstd(score) + 1e-6)
+
+    # Secondary axis = dominant morphology left after the environmental score.
+    design = np.column_stack([np.ones_like(score_z), score_z])
+    coef, *_ = np.linalg.lstsq(design, X_sc, rcond=None)
+    X_resid = X_sc - design @ coef
+    secondary = PCA(n_components=1, random_state=42).fit_transform(X_resid).flatten()
+    if _corr_or_nan(secondary, target) < 0:
+        secondary *= -1
+
+    score_edges = np.percentile(score, np.linspace(0, 100, n_cols + 1))
+    sec_edges = np.percentile(secondary, np.linspace(0, 100, n_rows + 1))
+    score_centers = np.percentile(score, np.linspace(50 / n_cols, 100 - 50 / n_cols, n_cols))
+    sec_centers = np.percentile(secondary, np.linspace(50 / n_rows, 100 - 50 / n_rows, n_rows))
+
+    selected = np.zeros((n_rows, n_cols), dtype=int)
+    cell_n = np.zeros((n_rows, n_cols), dtype=int)
+    cell_target = np.full((n_rows, n_cols), np.nan)
+    cell_sst = np.full((n_rows, n_cols), np.nan)
+    for r in range(n_rows):
+        sec_lo, sec_hi = sec_edges[r], sec_edges[r + 1]
+        for c in range(n_cols):
+            sc_lo, sc_hi = score_edges[c], score_edges[c + 1]
+            mask = (
+                (score >= sc_lo) & (score <= sc_hi if c == n_cols - 1 else score < sc_hi) &
+                (secondary >= sec_lo) & (secondary <= sec_hi if r == n_rows - 1 else secondary < sec_hi)
+            )
+            idxs = np.where(mask)[0]
+            if len(idxs) < 3:
+                # Sparse cells fall back to nearest points in the 2D atlas coordinates.
+                d = ((score - score_centers[c]) / (np.nanstd(score) + 1e-6)) ** 2
+                d += ((secondary - sec_centers[r]) / (np.nanstd(secondary) + 1e-6)) ** 2
+                idxs = np.argsort(d)[:max(10, min(50, len(d)))]
+            chosen = _choose_quality_medoid(X_sc, tiles_v, idxs)
+            selected[r, c] = chosen
+            cell_n[r, c] = len(idxs)
+            cell_target[r, c] = float(np.nanmedian(target[idxs]))
+            cell_sst[r, c] = float(np.nanmedian(sst_v[idxs])) if sst_v is not None else np.nan
+
+    z = X[selected.ravel()].astype("float32")
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    model = VAELightningModule.load_from_checkpoint(CHECKPOINT)
+    model.to(device).eval()
+    print(f"  Morphology atlas VAE loaded on {device}")
+    decoded = _decode_latents(model, device, z, batch_size=VAE_BATCH).reshape(n_rows, n_cols, 128, 128, 3)
+    observed = _tiles_to_rgb(tiles_v[selected.ravel()]).reshape(n_rows, n_cols, 128, 128, 3)
+
+    def save_grid(imgs, path, title, row_label):
+        fig, axes = plt.subplots(n_rows, n_cols, figsize=(n_cols * 2.15, n_rows * 2.25),
+                                 facecolor="#111111")
+        axes = np.asarray(axes).reshape(n_rows, n_cols)
+        for r in range(n_rows):
+            for c in range(n_cols):
+                ax = axes[r, c]
+                ax.imshow(imgs[r, c])
+                ax.set_xticks([]); ax.set_yticks([])
+                for sp in ax.spines.values():
+                    sp.set_edgecolor("#444444")
+                if r == 0:
+                    sst_txt = f"\nSST {cell_sst[r, c]:.1f}C" if np.isfinite(cell_sst[r, c]) else ""
+                    ax.set_title(
+                        f"{score_name} q{c + 1}\n{target_name} {cell_target[r, c]:.1f}{target_units}{sst_txt}",
+                        color="white", fontsize=7, pad=4)
+                if c == 0:
+                    ax.set_ylabel(f"{row_label}\nq{n_rows - r}", color="white",
+                                  fontsize=8, fontweight="bold", rotation=0,
+                                  labelpad=32, va="center")
+                if r == n_rows - 1:
+                    ax.set_xlabel(f"n={cell_n[r, c]}", color="#aaaaaa", fontsize=7)
+        fig.suptitle(title, color="white", fontsize=10, fontweight="bold")
+        plt.tight_layout(rect=[0, 0.02, 1, 0.91])
+        plt.savefig(path, dpi=180, bbox_inches="tight", facecolor="#111111")
+        print(f"  Saved morphology atlas -> {path}")
+        plt.close()
+
+    save_grid(
+        decoded,
+        decoded_path,
+        f"VAE-decoded cloud morphology atlas over the {score_name} manifold  {tag}\n"
+        "columns: increasing environmental score; rows: residual morphology mode; each panel decodes a real medoid latent",
+        "Morphology",
+    )
+    save_grid(
+        observed,
+        observed_path,
+        f"Observed MODIS medoids underlying the VAE morphology atlas  {tag}\n"
+        "same manifold cells as decoded atlas",
+        "Morphology",
+    )
+
+    return dict(
+        decoded_path=decoded_path,
+        observed_path=observed_path,
+        metrics={
+            "morph_atlas_cells": int(n_rows * n_cols),
+            "morph_atlas_min_cell_n": int(cell_n.min()),
+            "morph_atlas_median_cell_n": float(np.median(cell_n)),
+            "morph_atlas_score_target_corr": _corr_or_nan(score, target),
+        },
+    )
+
+
 # ── Main ─────────────────────────────────────────────────────────────────────
 def main():
     wandb.init(
@@ -958,6 +1097,9 @@ def main():
             make_sst_hero=MAKE_SST_HERO,
             make_proto_interp=MAKE_PROTO_INTERP,
             proto_n_steps=PROTO_N_STEPS,
+            make_morph_atlas=MAKE_MORPH_ATLAS,
+            atlas_n_cols=ATLAS_N_COLS,
+            atlas_n_rows=ATLAS_N_ROWS,
             n_pca_vae=N_PCA_VAE,
             n_walk_steps=N_WALK_STEPS,
             n_samples=N_SAMPLES,
@@ -1160,6 +1302,36 @@ def main():
         print(f"Checkpoint not found at {CHECKPOINT} — skipping prototype interpolation heroes.")
     else:
         print("MAKE_PROTO_INTERP disabled — skipping prototype interpolation heroes.")
+
+    # 5d. Decoded 2D morphology atlas over the learned EIS-associated manifold.
+    print("\n" + "=" * 60)
+    print("Step 5d — Decoded morphology atlas")
+    print("=" * 60)
+    if MAKE_MORPH_ATLAS and os.path.exists(CHECKPOINT):
+        vm = pipe["valid_mask"]
+        scores = pipe["physics_scores"]
+        atlas = morphology_atlas_hero(
+            X_vae         = X_vae[vm],
+            tiles         = tiles[vm],
+            score_vals    = scores,
+            target_vals   = eis[vm],
+            aux_sst       = sst[vm] if sst is not None else None,
+            tag           = f"(curated tiles, CF≥{CF_THRESH})",
+            score_name    = "CCA score",
+            target_name   = "EIS",
+            target_units  = " K",
+            decoded_path  = os.path.join(OUT_DIR, "hero_morph_atlas_ccascore_decoded.png"),
+            observed_path = os.path.join(OUT_DIR, "hero_morph_atlas_ccascore_observed.png"),
+            n_cols        = ATLAS_N_COLS,
+            n_rows        = ATLAS_N_ROWS,
+        )
+        hero_images["hero_morph_atlas_ccascore_decoded"] = atlas["decoded_path"]
+        hero_images["hero_morph_atlas_ccascore_observed"] = atlas["observed_path"]
+        hero_metrics.update(atlas["metrics"])
+    elif MAKE_MORPH_ATLAS:
+        print(f"Checkpoint not found at {CHECKPOINT} — skipping morphology atlas.")
+    else:
+        print("MAKE_MORPH_ATLAS disabled — skipping morphology atlas.")
 
     # 6. Bin-mosaic walk.
     print("\n" + "=" * 60)

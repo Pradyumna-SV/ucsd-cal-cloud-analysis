@@ -41,6 +41,12 @@ spec:
           value: "1"
         - name: PROTO_N_STEPS
           value: "9"
+        - name: MAKE_MORPH_ATLAS
+          value: "1"
+        - name: ATLAS_N_COLS
+          value: "6"
+        - name: ATLAS_N_ROWS
+          value: "5"
 
         - name: WANDB_PROJECT
           value: "ucsd-cal-cloud-cca"
