@@ -17,11 +17,25 @@ spec:
           value: "1"
         - name: PYTHONUNBUFFERED
           value: "1"
+        - name: WANDB_PROJECT
+          value: "ucsd-cal-cloud-cca"
+        - name: WANDB_RUN_NAME
+          value: "ccf-prep-nepac"
+        - name: WANDB_API_KEY
+          valueFrom:
+            secretKeyRef:
+              name: wandb-secret-prad-ccacloud
+              key: api-key
+        - name: SSH_PASSWORD   # not needed for prep, but harmless
+          valueFrom:
+            secretKeyRef:
+              name: ssh-secret-prad-nepac
+              key: password
         command: ["/bin/bash", "-c"]
         args:
           - |
             set -eo pipefail
-            pip install --quiet numpy pandas xarray netCDF4 scipy
+            pip install --quiet numpy pandas xarray netCDF4 scipy wandb
             apt-get update -q && apt-get install -y -q git
             git clone --depth 1 https://github.com/Pradyumna-SV/ucsd-cal-cloud-analysis /tmp/repo
             mkdir -p /workspace/ccf_preprocessed
@@ -40,4 +54,14 @@ spec:
       - name: embeddings-storage
         persistentVolumeClaim:
           claimName: prad-embeddings-5ti
-      tolerations: [... your standard tolerations ...]
+      tolerations:
+        - key: "nautilus.io/noceph"
+          operator: Exists
+          effect: NoSchedule
+        - key: "nautilus.io/group"
+          operator: Exists
+          effect: NoSchedule
+        - key: "kubernetes.io/arch"
+          value: "amd64"
+          operator: Equal
+          effect: NoSchedule

@@ -3,11 +3,11 @@
 Unified CCF pipeline for NE‑Pacific MODIS tiles.
 
 Environment variable PREP_ONLY:
-  PREP_ONLY=1  →  CPU‑only preprocessing: extract MERRA‑2 CCFs + IR means,
-                   save to /workspace/ccf_preprocessed/preprocessed.npz,
-                   then exit.
+  PREP_ONLY=1  →  CPU‑only preprocessing: extract MERRA‑2 CCF anomalies + IR means,
+                   save to /workspace/ccf_preprocessed/preprocessed.npz, then exit.
   otherwise    →  GPU pipeline: load preprocessed data, run VAE inference,
-                   perform IR‑removal + CCF regression + PCA, build atlas.
+                   perform IR‑removal + CCF regression + PCA, build atlas,
+                   log everything to Weights & Biases.
 """
 
 import os, sys, warnings
@@ -29,6 +29,11 @@ OUT_DIR    = "/workspace/results/ccf_pipeline"
 PREP_DIR   = "/workspace/ccf_preprocessed"
 VAE_BATCH  = 64
 
+# WandB will be initialised inside each mode if WANDB_PROJECT is set
+WANDB_PROJECT  = os.environ.get("WANDB_PROJECT", None)
+WANDB_RUN_NAME = os.environ.get("WANDB_RUN_NAME", None)
+WANDB_MODE     = "online"  # use "online" for real runs, "offline" for dry‑runs
+
 # GPU imports only if needed
 if not PREP_ONLY:
     import torch
@@ -40,7 +45,7 @@ if not PREP_ONLY:
 
 warnings.filterwarnings("ignore")
 
-# ── CCF extraction (used in PREP_ONLY mode) ──────────────────────────────
+# ── CCF extraction (works for both raw and anomaly files) ────────────────
 def extract_ccf_matrix(lat_arr, lon_arr, times_arr, ccf_nc_path):
     ds = xr.open_dataset(ccf_nc_path)
     var_names = ["TS", "EIS", "TS_adv", "RH700", "w700", "WS"]
@@ -61,8 +66,13 @@ def extract_ccf_matrix(lat_arr, lon_arr, times_arr, ccf_nc_path):
 
 # ── PREP ONLY: extract CCFs + IR means, save, exit ───────────────────────
 def run_prep():
-    print("=== PREP ONLY: extracting CCFs and IR means ===")
+    print("=== PREP ONLY: extracting CCF anomalies and IR means ===")
     os.makedirs(PREP_DIR, exist_ok=True)
+
+    # WandB (optional) – log basic stats
+    if WANDB_PROJECT:
+        import wandb
+        wandb.init(project=WANDB_PROJECT, name=WANDB_RUN_NAME or "ccf-prep", mode=WANDB_MODE)
 
     tiles = np.load(TILES_PATH)
     meta  = np.load(META_PATH, allow_pickle=True)
@@ -93,6 +103,10 @@ def run_prep():
                         lon     = lon,
                         times   = times.to_numpy())
     print(f"Saved preprocessed data -> {out_file}")
+
+    if WANDB_PROJECT:
+        wandb.log({"n_tiles_kept": len(tiles), "n_tiles_total": len(lat)})
+        wandb.finish()
 
 # ── GPU pipeline (after prep) ────────────────────────────────────────────
 def run_vae_inference(tiles):
@@ -218,17 +232,27 @@ def build_atlas(X_vae, env_pc1, res_pc1, n_cols=6, n_rows=5):
     out_path=os.path.join(OUT_DIR,"morphology_atlas.png")
     plt.savefig(out_path,dpi=150,bbox_inches="tight",facecolor="#111111")
     plt.close()
-    print(f"Atlas saved -> {out_path}")
+    return out_path
 
 def run_gpu_pipeline():
     print("=== GPU pipeline ===")
     os.makedirs(OUT_DIR, exist_ok=True)
+
+    # WandB
+    if WANDB_PROJECT:
+        import wandb
+        wandb.init(project=WANDB_PROJECT, name=WANDB_RUN_NAME or "ccf-gpu", mode=WANDB_MODE)
+
     prep = np.load(os.path.join(PREP_DIR, "preprocessed.npz"), allow_pickle=True)
     tiles, C, ir_mean = prep["tiles"], prep["C"], prep["ir_mean"]
     print(f"Loaded {len(tiles)} tiles")
+
     X_vae = run_vae_inference(tiles)
     pipe = run_ccf_pipeline(X_vae, ir_mean, C)
-    np.savez_compressed(os.path.join(OUT_DIR,"pipeline_results.npz"),
+
+    # Save numerical results
+    results_path = os.path.join(OUT_DIR, "pipeline_results.npz")
+    np.savez_compressed(results_path,
                         X_ir_free=pipe["X_ir_free"],
                         X_env_explained=pipe["X_env_explained"],
                         X_residual=pipe["X_residual"],
@@ -240,7 +264,28 @@ def run_gpu_pipeline():
                         var_res=pipe["var_res"],
                         env_reg_coef=pipe["env_regression_coef"],
                         CCF_vars=np.array(["TS","EIS","TS_adv","RH700","w700","WS"]))
-    build_atlas(X_vae, pipe["env_pcs"][:,0], pipe["res_pcs"][:,0])
+
+    atlas_path = build_atlas(X_vae, pipe["env_pcs"][:,0], pipe["res_pcs"][:,0])
+
+    if WANDB_PROJECT:
+        wandb.log({
+            "n_tiles": len(tiles),
+            "var_total": pipe["var_total"],
+            "var_ir_free": pipe["var_ir_free"],
+            "var_env": pipe["var_env"],
+            "var_res": pipe["var_res"],
+            "var_env_fraction": pipe["var_env"] / pipe["var_ir_free"],
+            "var_res_fraction": pipe["var_res"] / pipe["var_ir_free"],
+            "morphology_atlas": wandb.Image(atlas_path),
+            "results_npz": wandb.Artifact("pipeline_results", type="dataset", metadata={
+                "description": "CCF pipeline PCA scores and variance fractions"
+            })
+        })
+        # Save the results artifact (optional)
+        wandb.run.log_artifact(results_path, name="pipeline_results", type="dataset")
+        wandb.finish()
+
+    print("Done.")
 
 # ── Entry point ──────────────────────────────────────────────────────────
 if __name__ == "__main__":
