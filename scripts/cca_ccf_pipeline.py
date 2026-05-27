@@ -23,7 +23,7 @@ PREP_ONLY = os.environ.get("PREP_ONLY", "0").strip().lower() in ("1", "true", "y
 
 TILES_PATH = "/workspace/nepac_scratch/nepac_tiles.npy"
 META_PATH  = "/workspace/nepac_scratch/nepac_meta.npz"
-CCF_PATH   = "/workspace/merra2_2011_CCFs.nc"
+CCF_PATH   = "/workspace/merra2_2011_CCF_anomalies.nc"
 CKPT_PATH  = "/workspace/vae_checkpoint/lightning_model_50_transform.pt"
 OUT_DIR    = "/workspace/results/ccf_pipeline"
 PREP_DIR   = "/workspace/ccf_preprocessed"
