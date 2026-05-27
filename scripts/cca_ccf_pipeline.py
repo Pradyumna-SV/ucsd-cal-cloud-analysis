@@ -32,7 +32,7 @@ PREP_ONLY = _env_flag("PREP_ONLY")
 
 TILES_PATH = os.environ.get("TILES_PATH", "/workspace/nepac_scratch/nepac_tiles.npy")
 META_PATH  = os.environ.get("META_PATH",  "/workspace/nepac_scratch/nepac_meta.npz")
-CCF_PATH   = os.environ.get("CCF_PATH",   "/workspace/merra2_2011_CCF_anomalies.nc")
+CCF_PATH   = os.environ.get("CCF_PATH",   "/workspace/ccf_2011_fixed.nc")
 CHECKPOINT = os.environ.get("CHECKPOINT", "/workspace/vae_checkpoint/lightning_model_50_transform.pt")
 OUT_DIR    = os.environ.get("OUT_DIR",    "/workspace/results/ccf_pipeline")
 PREP_DIR   = os.environ.get("PREP_DIR",   "/workspace/ccf_preprocessed")
