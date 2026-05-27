@@ -1,38 +1,51 @@
 #!/usr/bin/env python3
 """
-Unified CCF pipeline for NE‑Pacific MODIS tiles.
+Unified CCF pipeline for NE-Pacific MODIS tiles.
 
 Environment variable PREP_ONLY:
-  PREP_ONLY=1  →  CPU‑only preprocessing: extract MERRA‑2 CCF anomalies + IR means,
+  PREP_ONLY=1  -> CPU-only preprocessing: extract MERRA-2 CCF anomalies + IR means,
                    save to /workspace/ccf_preprocessed/preprocessed.npz, then exit.
-  otherwise    →  GPU pipeline: load preprocessed data, run VAE inference,
-                   perform IR‑removal + CCF regression + PCA, build atlas,
+  otherwise    -> GPU pipeline: load preprocessed data, run VAE inference,
+                   perform IR-removal + CCF regression + PCA, build atlas,
                    log everything to Weights & Biases.
 """
 
-import os, sys, warnings
+import os
+import sys
+import warnings
+
+import matplotlib
 import numpy as np
 import pandas as pd
 import xarray as xr
-import matplotlib
+
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
-# ── Config ───────────────────────────────────────────────────────────────
-PREP_ONLY = os.environ.get("PREP_ONLY", "0").strip().lower() in ("1", "true", "yes")
 
-TILES_PATH = "/workspace/nepac_scratch/nepac_tiles.npy"
-META_PATH  = "/workspace/nepac_scratch/nepac_meta.npz"
-CCF_PATH   = "/workspace/merra2_2011_CCF_anomalies.nc"
-CKPT_PATH  = "/workspace/vae_checkpoint/lightning_model_50_transform.pt"
-OUT_DIR    = "/workspace/results/ccf_pipeline"
-PREP_DIR   = "/workspace/ccf_preprocessed"
-VAE_BATCH  = 64
+def _env_flag(name, default="0"):
+    return os.environ.get(name, default).strip().lower() in ("1", "true", "yes")
+
+
+# ── Config ───────────────────────────────────────────────────────────────────
+PREP_ONLY = _env_flag("PREP_ONLY")
+
+TILES_PATH = os.environ.get("TILES_PATH", "/workspace/nepac_scratch/nepac_tiles.npy")
+META_PATH  = os.environ.get("META_PATH",  "/workspace/nepac_scratch/nepac_meta.npz")
+CCF_PATH   = os.environ.get("CCF_PATH",   "/workspace/merra2_2011_CCF_anomalies.nc")
+CHECKPOINT = os.environ.get("CHECKPOINT", "/workspace/vae_checkpoint/lightning_model_50_transform.pt")
+OUT_DIR    = os.environ.get("OUT_DIR",    "/workspace/results/ccf_pipeline")
+PREP_DIR   = os.environ.get("PREP_DIR",   "/workspace/ccf_preprocessed")
+
+VAE_BATCH    = int(os.environ.get("VAE_BATCH",    64))
+ATLAS_N_COLS = int(os.environ.get("ATLAS_N_COLS", 6))
+ATLAS_N_ROWS = int(os.environ.get("ATLAS_N_ROWS", 5))
+CCF_VARS     = tuple(os.environ.get("CCF_VARS", "TS,EIS,TS_adv,RH700,w700,WS").split(","))
 
 # WandB will be initialised inside each mode if WANDB_PROJECT is set
 WANDB_PROJECT  = os.environ.get("WANDB_PROJECT", None)
 WANDB_RUN_NAME = os.environ.get("WANDB_RUN_NAME", None)
-WANDB_MODE     = "online"  # use "online" for real runs, "offline" for dry‑runs
+WANDB_MODE     = os.environ.get("WANDB_MODE", "online")
 
 # GPU imports only if needed
 if not PREP_ONLY:
@@ -41,19 +54,22 @@ if not PREP_ONLY:
     from sklearn.decomposition import PCA
     from sklearn.preprocessing import StandardScaler
     from scipy.spatial import cKDTree
-    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))  # to import vae
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 warnings.filterwarnings("ignore")
+os.makedirs(OUT_DIR, exist_ok=True)
+os.makedirs(PREP_DIR, exist_ok=True)
 
-# ── CCF extraction (works for both raw and anomaly files) ────────────────
+
+# ── CCF extraction (works for both raw and anomaly files) ─────────────────────
 def extract_ccf_matrix(lat_arr, lon_arr, times_arr, ccf_nc_path):
     ds = xr.open_dataset(ccf_nc_path)
-    var_names = ["TS", "EIS", "TS_adv", "RH700", "w700", "WS"]
+    var_names = CCF_VARS
     N = len(lat_arr)
-    C = np.full((N, 6), np.nan, dtype=np.float64)
+    C = np.full((N, len(var_names)), np.nan, dtype=np.float64)
     if not isinstance(times_arr, pd.DatetimeIndex):
         times_arr = pd.to_datetime(times_arr)
-    month_starts = times_arr.strftime('%Y-%m-01')
+    month_starts = times_arr.strftime("%Y-%m-01")
     for i in range(N):
         try:
             point = ds.sel(time=month_starts[i], lat=lat_arr[i], lon=lon_arr[i], method="nearest")
@@ -64,26 +80,39 @@ def extract_ccf_matrix(lat_arr, lon_arr, times_arr, ccf_nc_path):
     ds.close()
     return C
 
-# ── PREP ONLY: extract CCFs + IR means, save, exit ───────────────────────
+
+# ── PREP ONLY: extract CCFs + IR means, save, exit ────────────────────────────
 def run_prep():
     print("=== PREP ONLY: extracting CCF anomalies and IR means ===")
     os.makedirs(PREP_DIR, exist_ok=True)
 
-    # WandB (optional) – log basic stats
     if WANDB_PROJECT:
         import wandb
-        wandb.init(project=WANDB_PROJECT, name=WANDB_RUN_NAME or "ccf-prep", mode=WANDB_MODE)
+        wandb.init(
+            project=WANDB_PROJECT,
+            name=WANDB_RUN_NAME or "ccf-prep",
+            mode=WANDB_MODE,
+            config=dict(
+                prep_only=True,
+                tiles_path=TILES_PATH,
+                meta_path=META_PATH,
+                ccf_path=CCF_PATH,
+                prep_dir=PREP_DIR,
+                ccf_vars=CCF_VARS,
+            ),
+        )
 
     tiles = np.load(TILES_PATH)
     meta  = np.load(META_PATH, allow_pickle=True)
     lat   = meta["lat"].astype("float32")
     lon   = meta["lon"].astype("float32")
     times = pd.to_datetime(meta["time"])
-    print(f"Loaded {len(lat):,} tiles")
+    n_total = len(lat)
+    print(f"Loaded {n_total:,} tiles")
 
     C = extract_ccf_matrix(lat, lon, times, CCF_PATH)
     valid = np.isfinite(C).all(axis=1)
-    print(f"Complete CCFs: {valid.sum():,} / {len(lat):,}")
+    print(f"Complete CCFs: {valid.sum():,} / {n_total:,}")
 
     tiles   = tiles[valid]
     C       = C[valid]
@@ -95,24 +124,28 @@ def run_prep():
     print("IR means computed.")
 
     out_file = os.path.join(PREP_DIR, "preprocessed.npz")
-    np.savez_compressed(out_file,
-                        tiles   = tiles,
-                        C       = C,
-                        ir_mean = ir_mean,
-                        lat     = lat,
-                        lon     = lon,
-                        times   = times.to_numpy())
+    np.savez_compressed(
+        out_file,
+        tiles    = tiles,
+        C        = C,
+        ir_mean  = ir_mean,
+        lat      = lat,
+        lon      = lon,
+        times    = times.to_numpy(),
+        ccf_vars = np.array(CCF_VARS),
+    )
     print(f"Saved preprocessed data -> {out_file}")
 
     if WANDB_PROJECT:
-        wandb.log({"n_tiles_kept": len(tiles), "n_tiles_total": len(lat)})
+        wandb.log({"n_tiles_kept": len(tiles), "n_tiles_total": n_total})
         wandb.finish()
 
-# ── GPU pipeline (after prep) ────────────────────────────────────────────
+
+# ── GPU pipeline (after prep) ─────────────────────────────────────────────────
 def run_vae_inference(tiles):
     from vae import VAELightningModule
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model = VAELightningModule.load_from_checkpoint(CKPT_PATH)
+    model = VAELightningModule.load_from_checkpoint(CHECKPOINT)
     model.to(device).eval()
     print(f"VAE loaded on {device}")
     embeddings = []
@@ -132,7 +165,7 @@ def run_vae_inference(tiles):
 def decode_latents(z, batch_size=64):
     from vae import VAELightningModule
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model = VAELightningModule.load_from_checkpoint(CKPT_PATH)
+    model = VAELightningModule.load_from_checkpoint(CHECKPOINT)
     model.to(device).eval()
     outs = []
     z = np.asarray(z, dtype="float32")
@@ -148,7 +181,7 @@ def decode_latents(z, batch_size=64):
 def tile_to_rgb(tile):
     arr = np.asarray(tile, dtype="float32")
     if arr.ndim == 3 and arr.shape[0] == 3:
-        arr = arr.transpose(1,2,0)
+        arr = arr.transpose(1, 2, 0)
     arr = np.nan_to_num(arr, nan=0.0, posinf=0.0, neginf=0.0)
     out = np.empty_like(arr)
     for c in range(arr.shape[2]):
@@ -160,23 +193,23 @@ def tile_to_rgb(tile):
             out[..., c] = np.clip((ch - lo) / (hi - lo), 0, 1)
     return out
 
+
 def run_ccf_pipeline(X_vae, ir_mean, C):
-    # Step 0
-    ir_reg = LinearRegression().fit(ir_mean.reshape(-1,1), X_vae)
-    X_ir_free = X_vae - ir_reg.predict(ir_mean.reshape(-1,1))
-    # Step 1
+    ir_reg = LinearRegression().fit(ir_mean.reshape(-1, 1), X_vae)
+    X_ir_free = X_vae - ir_reg.predict(ir_mean.reshape(-1, 1))
+
     scaler_C = StandardScaler().fit(C)
     C_scaled = scaler_C.transform(C)
     env_reg = LinearRegression().fit(C_scaled, X_ir_free)
     X_env_explained = env_reg.predict(C_scaled)
     X_residual = X_ir_free - X_env_explained
-    # Steps 2-3
+
     n_comp = min(2, X_env_explained.shape[1] - 1, X_env_explained.shape[0] // 10)
     pca_env = PCA(n_components=n_comp, random_state=42).fit(X_env_explained)
     env_pcs = pca_env.transform(X_env_explained)
     pca_res = PCA(n_components=n_comp, random_state=42).fit(X_residual)
     res_pcs = pca_res.transform(X_residual)
-    # Variance
+
     var_total = np.var(X_vae, axis=0).sum()
     var_ir_free = np.var(X_ir_free, axis=0).sum()
     var_env = np.var(X_env_explained, axis=0).sum()
@@ -192,56 +225,104 @@ def run_ccf_pipeline(X_vae, ir_mean, C):
         var_total=var_total, var_ir_free=var_ir_free, var_env=var_env, var_res=var_res,
     )
 
-def build_atlas(X_vae, env_pc1, res_pc1, n_cols=6, n_rows=5):
+
+def build_atlas(X_vae, tiles, env_pc1, res_pc1, n_cols=6, n_rows=5):
     coords = np.column_stack([env_pc1, res_pc1])
     tree = cKDTree(coords)
-    env_edges = np.percentile(env_pc1, np.linspace(0,100,n_cols+1))
-    res_edges = np.percentile(res_pc1, np.linspace(0,100,n_rows+1))
-    env_centers = np.percentile(env_pc1, np.linspace(50/n_cols,100-50/n_cols,n_cols))
-    res_centers = np.percentile(res_pc1, np.linspace(50/n_rows,100-50/n_rows,n_rows))
+    env_edges = np.percentile(env_pc1, np.linspace(0, 100, n_cols + 1))
+    res_edges = np.percentile(res_pc1, np.linspace(0, 100, n_rows + 1))
+    env_centers = np.percentile(env_pc1, np.linspace(50 / n_cols, 100 - 50 / n_cols, n_cols))
+    res_centers = np.percentile(res_pc1, np.linspace(50 / n_rows, 100 - 50 / n_rows, n_rows))
     chosen_idxs = np.zeros((n_rows, n_cols), dtype=int)
     cell_medians = np.zeros((n_rows, n_cols, 2))
     cell_counts = np.zeros((n_rows, n_cols), dtype=int)
     for r in range(n_rows):
-        res_lo, res_hi = res_edges[r], res_edges[r+1]
+        res_lo, res_hi = res_edges[r], res_edges[r + 1]
         for c in range(n_cols):
-            env_lo, env_hi = env_edges[c], env_edges[c+1]
-            mask = (env_pc1>=env_lo)&(env_pc1<env_hi if c<n_cols-1 else env_pc1<=env_hi)& \
-                   (res_pc1>=res_lo)&(res_pc1<res_hi if r<n_rows-1 else res_pc1<=res_hi)
-            if mask.sum()>0:
-                center=np.array([np.median(env_pc1[mask]), np.median(res_pc1[mask])])
-                dist,idx=tree.query(center.reshape(1,-1),k=1)
-                chosen_idxs[r,c]=idx[0]; cell_medians[r,c]=center; cell_counts[r,c]=mask.sum()
+            env_lo, env_hi = env_edges[c], env_edges[c + 1]
+            env_mask = (env_pc1 >= env_lo) & ((env_pc1 < env_hi) if c < n_cols - 1 else (env_pc1 <= env_hi))
+            res_mask = (res_pc1 >= res_lo) & ((res_pc1 < res_hi) if r < n_rows - 1 else (res_pc1 <= res_hi))
+            mask = env_mask & res_mask
+            if mask.sum() > 0:
+                idxs = np.where(mask)[0]
+                center = np.array([np.median(env_pc1[idxs]), np.median(res_pc1[idxs])])
+                local_dist = np.linalg.norm(coords[idxs] - center, axis=1)
+                chosen_idxs[r, c] = int(idxs[np.argmin(local_dist)])
+                cell_medians[r, c] = center
+                cell_counts[r, c] = len(idxs)
             else:
-                center=np.array([env_centers[c], res_centers[r]])
-                dist,idx=tree.query(center.reshape(1,-1),k=1)
-                chosen_idxs[r,c]=idx[0]; cell_medians[r,c]=center; cell_counts[r,c]=1
+                center = np.array([env_centers[c], res_centers[r]])
+                _, idx = tree.query(center.reshape(1, -1), k=1)
+                chosen_idxs[r, c] = int(idx[0])
+                cell_medians[r, c] = center
+                cell_counts[r, c] = 1
     z = X_vae[chosen_idxs.ravel()].astype("float32")
     decoded = decode_latents(z).reshape(n_rows, n_cols, 128, 128, 3)
-    fig, axes = plt.subplots(n_rows, n_cols, figsize=(n_cols*2.2, n_rows*2.3), facecolor="#111111")
-    axes = np.asarray(axes).reshape(n_rows, n_cols)
-    for r in range(n_rows):
-        for c in range(n_cols):
-            ax=axes[r,c]; ax.imshow(tile_to_rgb(decoded[r,c]))
-            ax.set_xticks([]); ax.set_yticks([])
-            for sp in ax.spines.values(): sp.set_edgecolor("#444444")
-            if r==0: ax.set_title(f"envPC1={cell_medians[r,c,0]:.2f}\nn={cell_counts[r,c]}",color="white",fontsize=7,pad=4)
-            if c==0: ax.set_ylabel(f"resPC1\n{cell_medians[r,c,1]:.2f}",color="white",fontsize=8,fontweight="bold",rotation=0,labelpad=32,va="center")
-    fig.suptitle("VAE‑decoded morphology atlas: envPC1 × resPC1",color="white",fontsize=10,fontweight="bold")
-    plt.tight_layout(rect=[0,0.02,1,0.91])
-    out_path=os.path.join(OUT_DIR,"morphology_atlas.png")
-    plt.savefig(out_path,dpi=150,bbox_inches="tight",facecolor="#111111")
-    plt.close()
-    return out_path
+    observed = np.array([tile_to_rgb(tiles[i]) for i in chosen_idxs.ravel()]).reshape(n_rows, n_cols, 128, 128, 3)
+
+    def save_grid(imgs, out_name, title, decoded_grid=False):
+        fig, axes = plt.subplots(n_rows, n_cols, figsize=(n_cols * 2.2, n_rows * 2.3),
+                                 facecolor="#111111")
+        axes = np.asarray(axes).reshape(n_rows, n_cols)
+        for r in range(n_rows):
+            for c in range(n_cols):
+                ax = axes[r, c]
+                ax.imshow(imgs[r, c] if decoded_grid else tile_to_rgb(imgs[r, c]))
+                ax.set_xticks([]); ax.set_yticks([])
+                for sp in ax.spines.values():
+                    sp.set_edgecolor("#444444")
+                if r == 0:
+                    ax.set_title(
+                        f"envPC1={cell_medians[r, c, 0]:.2f}\nn={cell_counts[r, c]}",
+                        color="white", fontsize=7, pad=4)
+                if c == 0:
+                    ax.set_ylabel(
+                        f"resPC1\n{cell_medians[r, c, 1]:.2f}",
+                        color="white", fontsize=8, fontweight="bold",
+                        rotation=0, labelpad=32, va="center")
+        fig.suptitle(title, color="white", fontsize=10, fontweight="bold")
+        plt.tight_layout(rect=[0, 0.02, 1, 0.91])
+        out_path = os.path.join(OUT_DIR, out_name)
+        plt.savefig(out_path, dpi=150, bbox_inches="tight", facecolor="#111111")
+        plt.close()
+        print(f"Saved atlas -> {out_path}")
+        return out_path
+
+    decoded_path = save_grid(
+        decoded,
+        "morphology_atlas_decoded.png",
+        "VAE-decoded morphology atlas: envPC1 x resPC1",
+        decoded_grid=True,
+    )
+    observed_path = save_grid(
+        observed,
+        "morphology_atlas_observed.png",
+        "Observed MODIS medoids for CCF morphology atlas",
+        decoded_grid=True,
+    )
+    return decoded_path, observed_path
 
 def run_gpu_pipeline():
     print("=== GPU pipeline ===")
     os.makedirs(OUT_DIR, exist_ok=True)
 
-    # WandB
     if WANDB_PROJECT:
         import wandb
-        wandb.init(project=WANDB_PROJECT, name=WANDB_RUN_NAME or "ccf-gpu", mode=WANDB_MODE)
+        wandb.init(
+            project=WANDB_PROJECT,
+            name=WANDB_RUN_NAME or "ccf-gpu",
+            mode=WANDB_MODE,
+            config=dict(
+                prep_only=False,
+                prep_dir=PREP_DIR,
+                out_dir=OUT_DIR,
+                checkpoint=os.path.basename(CHECKPOINT),
+                vae_batch=VAE_BATCH,
+                atlas_n_cols=ATLAS_N_COLS,
+                atlas_n_rows=ATLAS_N_ROWS,
+                ccf_vars=CCF_VARS,
+            ),
+        )
 
     prep = np.load(os.path.join(PREP_DIR, "preprocessed.npz"), allow_pickle=True)
     tiles, C, ir_mean = prep["tiles"], prep["C"], prep["ir_mean"]
@@ -263,11 +344,22 @@ def run_gpu_pipeline():
                         var_env=pipe["var_env"],
                         var_res=pipe["var_res"],
                         env_reg_coef=pipe["env_regression_coef"],
-                        CCF_vars=np.array(["TS","EIS","TS_adv","RH700","w700","WS"]))
+                        CCF_vars=np.array(CCF_VARS))
 
-    atlas_path = build_atlas(X_vae, pipe["env_pcs"][:,0], pipe["res_pcs"][:,0])
+    decoded_atlas_path, observed_atlas_path = build_atlas(
+        X_vae,
+        tiles,
+        pipe["env_pcs"][:, 0],
+        pipe["res_pcs"][:, 0],
+        n_cols=ATLAS_N_COLS,
+        n_rows=ATLAS_N_ROWS,
+    )
 
     if WANDB_PROJECT:
+        artifact = wandb.Artifact("ccf_pipeline_results", type="dataset", metadata={
+            "description": "CCF pipeline PCA scores and variance fractions"
+        })
+        artifact.add_file(results_path)
         wandb.log({
             "n_tiles": len(tiles),
             "var_total": pipe["var_total"],
@@ -276,13 +368,10 @@ def run_gpu_pipeline():
             "var_res": pipe["var_res"],
             "var_env_fraction": pipe["var_env"] / pipe["var_ir_free"],
             "var_res_fraction": pipe["var_res"] / pipe["var_ir_free"],
-            "morphology_atlas": wandb.Image(atlas_path),
-            "results_npz": wandb.Artifact("pipeline_results", type="dataset", metadata={
-                "description": "CCF pipeline PCA scores and variance fractions"
-            })
+            "ccf_morphology_atlas_decoded": wandb.Image(decoded_atlas_path),
+            "ccf_morphology_atlas_observed": wandb.Image(observed_atlas_path),
         })
-        # Save the results artifact (optional)
-        wandb.run.log_artifact(results_path, name="pipeline_results", type="dataset")
+        wandb.log_artifact(artifact)
         wandb.finish()
 
     print("Done.")

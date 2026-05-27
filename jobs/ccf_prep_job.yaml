@@ -17,29 +17,47 @@ spec:
           value: "1"
         - name: PYTHONUNBUFFERED
           value: "1"
+        - name: TILES_PATH
+          value: /workspace/nepac_scratch/nepac_tiles.npy
+        - name: META_PATH
+          value: /workspace/nepac_scratch/nepac_meta.npz
+        - name: CCF_PATH
+          value: /workspace/merra2_2011_CCF_anomalies.nc
+        - name: OUT_DIR
+          value: /workspace/results/ccf_pipeline
+        - name: PREP_DIR
+          value: /workspace/ccf_preprocessed
         - name: WANDB_PROJECT
           value: "ucsd-cal-cloud-cca"
         - name: WANDB_RUN_NAME
           value: "ccf-prep-nepac"
+        - name: WANDB_MODE
+          value: "online"
         - name: WANDB_API_KEY
           valueFrom:
             secretKeyRef:
               name: wandb-secret-prad-ccacloud
               key: api-key
-        - name: SSH_PASSWORD   # not needed for prep, but harmless
-          valueFrom:
-            secretKeyRef:
-              name: ssh-secret-prad-nepac
-              key: password
         command: ["/bin/bash", "-c"]
         args:
           - |
             set -eo pipefail
-            pip install --quiet numpy pandas xarray netCDF4 scipy wandb
+
             apt-get update -q && apt-get install -y -q git
-            git clone --depth 1 https://github.com/Pradyumna-SV/ucsd-cal-cloud-analysis /tmp/repo
+
+            REPO_DIR=/tmp/repo
+            rm -rf "$REPO_DIR"
+            git clone --depth 1 https://github.com/Pradyumna-SV/ucsd-cal-cloud-analysis "$REPO_DIR"
+
+            pip install --quiet numpy pandas xarray netCDF4 scipy wandb
+
             mkdir -p /workspace/ccf_preprocessed
-            python3 /tmp/repo/scripts/cca_ccf_pipeline.py
+            mkdir -p /workspace/results/ccf_pipeline
+            mkdir -p /workspace/logs
+
+            {
+              python3 "$REPO_DIR/scripts/cca_ccf_pipeline.py"
+            } 2>&1 | tee "/workspace/logs/ccf_prep_$(hostname)_$(date +%Y%m%d_%H%M%S).log"
         resources:
           limits:
             cpu: "4"

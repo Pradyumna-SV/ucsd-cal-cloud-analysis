@@ -14,37 +14,56 @@ spec:
         image: pytorch/pytorch:2.6.0-cuda11.8-cudnn9-devel
         env:
         - name: PREP_ONLY
-          value: "0"   # or omit
+          value: "0"
         - name: PYTHONUNBUFFERED
           value: "1"
+        - name: OUT_DIR
+          value: /workspace/results/ccf_pipeline
+        - name: PREP_DIR
+          value: /workspace/ccf_preprocessed
+        - name: CHECKPOINT
+          value: /workspace/vae_checkpoint/lightning_model_50_transform.pt
+        - name: VAE_BATCH
+          value: "64"
+        - name: ATLAS_N_COLS
+          value: "6"
+        - name: ATLAS_N_ROWS
+          value: "5"
         - name: WANDB_PROJECT
           value: "ucsd-cal-cloud-cca"
         - name: WANDB_RUN_NAME
           value: "ccf-gpu-nepac"
+        - name: WANDB_MODE
+          value: "online"
         - name: WANDB_API_KEY
           valueFrom:
             secretKeyRef:
               name: wandb-secret-prad-ccacloud
               key: api-key
-        - name: SSH_PASSWORD   # not needed, but may be required by the script for other uses
-          valueFrom:
-            secretKeyRef:
-              name: ssh-secret-prad-nepac
-              key: password
         command: ["/bin/bash", "-c"]
         args:
           - |
             set -eo pipefail
+
             apt-get update -q && apt-get install -y -q git
-            git clone --depth 1 https://github.com/Pradyumna-SV/ucsd-cal-cloud-analysis /tmp/repo
+
+            REPO_DIR=/tmp/repo
+            rm -rf "$REPO_DIR"
+            git clone --depth 1 https://github.com/Pradyumna-SV/ucsd-cal-cloud-analysis "$REPO_DIR"
+
             pip install --quiet \
               numpy pandas scipy scikit-learn \
               xarray zarr gcsfs \
               pytorch-lightning \
               matplotlib \
               wandb
+
             mkdir -p /workspace/results/ccf_pipeline
-            python3 /tmp/repo/scripts/cca_ccf_pipeline.py
+            mkdir -p /workspace/logs
+
+            {
+              python3 "$REPO_DIR/scripts/cca_ccf_pipeline.py"
+            } 2>&1 | tee "/workspace/logs/ccf_gpu_$(hostname)_$(date +%Y%m%d_%H%M%S).log"
         resources:
           limits:
             cpu: "8"
