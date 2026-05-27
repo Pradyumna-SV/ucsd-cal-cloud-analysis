@@ -11,7 +11,7 @@ spec:
       restartPolicy: Never
       containers:
       - name: ccf-prep
-        image: pytorch/pytorch:2.6.0-cuda11.8-cudnn9-devel
+        image: python:3.10-slim
         env:
         - name: PREP_ONLY
           value: "1"
@@ -49,7 +49,7 @@ spec:
             rm -rf "$REPO_DIR"
             git clone --depth 1 https://github.com/Pradyumna-SV/ucsd-cal-cloud-analysis "$REPO_DIR"
 
-            pip install --quiet numpy pandas xarray netCDF4 scipy wandb
+            pip install --quiet numpy pandas xarray netCDF4 scipy wandb matplotlib
 
             mkdir -p /workspace/ccf_preprocessed
             mkdir -p /workspace/results/ccf_pipeline
