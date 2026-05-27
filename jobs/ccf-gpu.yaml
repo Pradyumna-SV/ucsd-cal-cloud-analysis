@@ -1,0 +1,51 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: prad-ccf-gpu
+  namespace: climate-analytics
+spec:
+  backoffLimit: 0
+  ttlSecondsAfterFinished: 86400
+  template:
+    spec:
+      restartPolicy: Never
+      containers:
+      - name: ccf-gpu
+        image: pytorch/pytorch:2.6.0-cuda11.8-cudnn9-devel
+        env:
+        - name: PREP_ONLY
+          value: "0"   # or just omit it
+        - name: PYTHONUNBUFFERED
+          value: "1"
+        command: ["/bin/bash", "-c"]
+        args:
+          - |
+            set -eo pipefail
+            apt-get update -q && apt-get install -y -q git
+            git clone --depth 1 https://github.com/Pradyumna-SV/ucsd-cal-cloud-analysis /tmp/repo
+            pip install --quiet \
+              numpy pandas scipy scikit-learn \
+              xarray zarr gcsfs \
+              pytorch-lightning \
+              matplotlib \
+              wandb
+            mkdir -p /workspace/results/ccf_pipeline
+            python3 /tmp/repo/scripts/cca_ccf_pipeline.py
+        resources:
+          limits:
+            cpu: "8"
+            memory: "32Gi"
+            nvidia.com/gpu: "1"
+          requests:
+            cpu: "8"
+            memory: "32Gi"
+            nvidia.com/gpu: "1"
+        volumeMounts:
+        - name: embeddings-storage
+          mountPath: /workspace
+      volumes:
+      - name: embeddings-storage
+        persistentVolumeClaim:
+          claimName: prad-embeddings-5ti
+      tolerations: [... your standard tolerations ...]
+      affinity: [... your GPU affinity ...]
