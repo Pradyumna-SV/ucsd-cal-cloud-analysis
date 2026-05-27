@@ -11,7 +11,7 @@ spec:
       restartPolicy: Never
       containers:
       - name: ccf-prep
-        image: python:3.10-slim
+        image: pytorch/pytorch:2.6.0-cuda11.8-cudnn9-devel
         env:
         - name: PREP_ONLY
           value: "1"
