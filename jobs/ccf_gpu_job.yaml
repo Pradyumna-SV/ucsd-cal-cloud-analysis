@@ -29,6 +29,16 @@ spec:
           value: "6"
         - name: ATLAS_N_ROWS
           value: "5"
+        - name: ATLAS_COL_VAR
+          value: "EIS"
+        - name: ATLAS_ROW_VAR
+          value: "morph_resid"
+        - name: ATLAS_COL_ABS
+          value: "1"
+        - name: ATLAS_MAKE_PC
+          value: "1"
+        - name: ATLAS_MAKE_TS
+          value: "0"
         - name: WANDB_PROJECT
           value: "ucsd-cal-cloud-cca"
         - name: WANDB_RUN_NAME
