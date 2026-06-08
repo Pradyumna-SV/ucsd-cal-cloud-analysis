@@ -197,8 +197,8 @@ def main():
     del rgb_pca
 
     print("Plotting global cloud regimes...")
-    fig, ax = plt.subplots(figsize=(20, 10), facecolor="white")
-    ax.set_facecolor("white")
+    fig, ax = plt.subplots(figsize=(20, 10), facecolor="black")
+    ax.set_facecolor("black")
     ax.scatter(
         lons, lats, c=colors, s=0.05, alpha=0.8, marker="s",
         linewidths=0, rasterized=True,
@@ -206,18 +206,18 @@ def main():
 
     ax.set_title(
         "Global Cloud Regimes (2002-2022) - PCA Projected Tile2Vec Embeddings",
-        color="black",
+        color="white",
         fontsize=20,
     )
-    ax.set_xlabel("Longitude", color="black")
-    ax.set_ylabel("Latitude", color="black")
+    ax.set_xlabel("Longitude", color="white")
+    ax.set_ylabel("Latitude", color="white")
     ax.grid(False)
     ax.set_xlim(-180, 180)
     ax.set_ylim(-90, 90)
-    ax.tick_params(axis="both", colors="black")
+    ax.tick_params(axis="both", colors="white")
 
     out_path = os.path.join(OUT_DIR, OUT_NAME)
-    fig.savefig(out_path, dpi=300, facecolor="white", bbox_inches="tight")
+    fig.savefig(out_path, dpi=300, facecolor="black", bbox_inches="tight")
     plt.close(fig)
     print(f"Map saved -> {out_path}")
 
