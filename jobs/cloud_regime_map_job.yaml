@@ -17,18 +17,16 @@ spec:
           value: "1"
         - name: MPLCONFIGDIR
           value: /tmp/mplconfig
-        - name: BASE_DIR
+        - name: EMBED_DIR
           value: /workspace/embeddings
         - name: OUT_DIR
           value: /workspace/results/cloud_regime_map
-        - name: START_DATE
-          value: "2002-01-01"
-        - name: END_DATE
-          value: "2022-12-31"
+        - name: STREAM_STRIDE
+          value: "11"
         - name: SUBSAMPLE_RATE
           value: "0.05"
-        - name: DAY_STRIDE
-          value: "11"
+        - name: MAX_PER_DAY
+          value: "2000"
         - name: RANDOM_SEED
           value: "42"
         - name: OUT_NAME
@@ -52,14 +50,20 @@ spec:
             apt-get update -q && apt-get install -y -q git
             mkdir -p /tmp/mplconfig
 
-            REPO_DIR=/tmp/repo
-            rm -rf "$REPO_DIR"
-            git clone --depth 1 https://github.com/Pradyumna-SV/ucsd-cal-cloud-analysis "$REPO_DIR"
+            REPO_DIR=/workspace/repo
+            if [ ! -d "$REPO_DIR/.git" ]; then
+              git clone --depth 1 https://github.com/Pradyumna-SV/ucsd-cal-cloud-analysis "$REPO_DIR"
+            else
+              echo "Repo exists, pulling latest..."
+              cd "$REPO_DIR" && git reset --hard HEAD && git pull origin master
+            fi
 
-            pip install --quiet numpy scikit-learn matplotlib psutil wandb
+            pip install --quiet numpy pandas scikit-learn matplotlib psutil wandb
 
             mkdir -p /workspace/results/cloud_regime_map
             mkdir -p /workspace/logs
+
+            export MANIFEST="$REPO_DIR/manifest.csv"
 
             {
               python3 "$REPO_DIR/scripts/cloud_regime_map.py"

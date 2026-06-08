@@ -2,41 +2,43 @@
 """
 Global cloud-regime map from Tile2Vec embeddings.
 
-Reads daily tile2vec.npy + centers.json files, subsamples, runs PCA(3) for RGB
-colors, and saves a lat/lon scatter map.
+Uses the same PVC layout and manifest day queue as scripts/cca_20yr.py:
+  /workspace/embeddings/YYYY/MM/DD/YYYY_MM_DD_tile2vec.npy
+  /workspace/embeddings/YYYY/MM/DD/YYYY_MM_DD_centers.json
 
 Environment variables (all optional):
-  BASE_DIR        embeddings root          default: /workspace/embeddings
-  OUT_DIR         output directory         default: /workspace/results/cloud_regime_map
-  START_DATE      YYYY-MM-DD               default: 2002-01-01
-  END_DATE        YYYY-MM-DD               default: 2022-12-31
-  SUBSAMPLE_RATE  fraction per day         default: 0.05
-  DAY_STRIDE      process every Nth day      default: 11
-  RANDOM_SEED     subsample seed           default: 42
-  OUT_NAME        output png filename      default: cloud_regime_map_20years.png
-  WANDB_PROJECT   W&B project name         default: unset (skip logging)
-  WANDB_RUN_NAME  W&B run name             default: cloud-regime-map
-  WANDB_MODE      online/offline/disabled  default: online
+  EMBED_DIR       embeddings root on PVC     default: /workspace/embeddings
+  MANIFEST        manifest.csv path          default: /workspace/repo/manifest.csv
+  OUT_DIR         output directory           default: /workspace/results/cloud_regime_map
+  STREAM_STRIDE   every Nth OK manifest day  default: 11
+  SUBSAMPLE_RATE  fraction per day           default: 0.05
+  MAX_PER_DAY     cap tiles kept per day     default: 2000
+  RANDOM_SEED     subsample seed             default: 42
+  OUT_NAME        output png filename        default: cloud_regime_map_20years.png
+  WANDB_PROJECT   W&B project                default: unset (skip logging)
+  WANDB_RUN_NAME  W&B run name               default: cloud-regime-map
+  WANDB_MODE      online/offline/disabled    default: online
 """
 
-import datetime
 import json
 import os
+from pathlib import Path
 
 import matplotlib
 
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
+import pandas as pd
 import psutil
 from sklearn.decomposition import PCA
 
-BASE_DIR = os.environ.get("BASE_DIR", "/workspace/embeddings")
+EMBED_DIR = os.environ.get("EMBED_DIR", os.environ.get("BASE_DIR", "/workspace/embeddings"))
+MANIFEST = os.environ.get("MANIFEST", "/workspace/repo/manifest.csv")
 OUT_DIR = os.environ.get("OUT_DIR", "/workspace/results/cloud_regime_map")
-START_DATE = datetime.date.fromisoformat(os.environ.get("START_DATE", "2002-01-01"))
-END_DATE = datetime.date.fromisoformat(os.environ.get("END_DATE", "2022-12-31"))
+STREAM_STRIDE = max(1, int(os.environ.get("STREAM_STRIDE", os.environ.get("DAY_STRIDE", "11"))))
 SUBSAMPLE_RATE = float(os.environ.get("SUBSAMPLE_RATE", "0.05"))
-DAY_STRIDE = max(1, int(os.environ.get("DAY_STRIDE", "11")))
+MAX_PER_DAY = max(1, int(os.environ.get("MAX_PER_DAY", "2000")))
 RANDOM_SEED = int(os.environ.get("RANDOM_SEED", "42"))
 OUT_NAME = os.environ.get("OUT_NAME", "cloud_regime_map_20years.png")
 WANDB_PROJECT = os.environ.get("WANDB_PROJECT", None)
@@ -51,32 +53,68 @@ def check_memory(label=""):
           f"Total: {mem.total / (1024**3):.2f} GiB ({mem.percent}%)")
 
 
-def load_day_coords(centers_dict):
-    """Flatten centers.json in sorted timestamp order (matches cca_20yr.py)."""
-    coords = []
-    for ts in sorted(centers_dict.keys()):
-        for lat, lon in centers_dict[ts]:
-            coords.append((float(lat), float(lon)))
-    return np.asarray(coords, dtype=np.float64)
+def load_day_tile2vec(year, month, day):
+    """
+    Load one day's Tile2Vec embeddings + lat/lon.
+    Mirrors scripts/cca_20yr.py::load_day (tile2vec path only).
+    """
+    prefix = f"{year}_{month:02d}_{day:02d}"
+    day_dir = Path(EMBED_DIR) / str(year) / f"{month:02d}" / f"{day:02d}"
+    t2v_p = day_dir / f"{prefix}_tile2vec.npy"
+    meta_p = day_dir / f"{prefix}_centers.json"
+
+    if not (t2v_p.exists() and meta_p.exists()):
+        return None
+
+    try:
+        t2v_arr = np.load(t2v_p).squeeze()
+    except Exception as exc:
+        print(f"  [skip] {prefix}: corrupt tile2vec ({exc})")
+        return None
+
+    try:
+        with open(meta_p, encoding="utf-8") as f:
+            meta = json.load(f)
+    except Exception as exc:
+        print(f"  [skip] {prefix}: corrupt centers json ({exc})")
+        return None
+
+    lats, lons = [], []
+    for ts in sorted(meta.keys()):
+        for lat, lon in meta[ts]:
+            lats.append(float(lat))
+            lons.append(float(lon))
+
+    if not lats:
+        print(f"  [skip] {prefix}: empty centers json")
+        return None
+
+    n = min(len(lats), len(t2v_arr))
+    if n < len(lats):
+        print(f"  [warn] {prefix}: tile2vec shorter than centers ({n} vs {len(lats)}), truncating")
+
+    return {
+        "prefix": prefix,
+        "t2v": np.asarray(t2v_arr[:n], dtype=np.float32),
+        "lat": np.asarray(lats[:n], dtype=np.float64),
+        "lon": np.asarray(lons[:n], dtype=np.float64),
+    }
 
 
-def iter_day_paths():
-    current = START_DATE
-    day_index = 0
-    while current <= END_DATE:
-        if day_index % DAY_STRIDE == 0:
-            year_str = current.strftime("%Y")
-            month_str = current.strftime("%m")
-            day_str = current.strftime("%d")
-            filename_date = current.strftime("%Y_%m_%d")
-            day_dir = os.path.join(BASE_DIR, year_str, month_str, day_str)
-            yield (
-                os.path.join(day_dir, f"{filename_date}_tile2vec.npy"),
-                os.path.join(day_dir, f"{filename_date}_centers.json"),
-                filename_date,
-            )
-        current += datetime.timedelta(days=1)
-        day_index += 1
+def load_manifest_queue():
+    if not os.path.exists(MANIFEST):
+        raise FileNotFoundError(
+            f"Manifest not found at {MANIFEST}. "
+            "Set MANIFEST to manifest.csv on the PVC or in the cloned repo."
+        )
+    manifest = pd.read_csv(MANIFEST)
+    queue = (
+        manifest[manifest["status"] == "OK"]
+        .sort_values(["year", "month", "day"])
+        .reset_index(drop=True)
+    )
+    queue = queue.iloc[::STREAM_STRIDE].reset_index(drop=True)
+    return queue
 
 
 def main():
@@ -90,20 +128,21 @@ def main():
             name=WANDB_RUN_NAME or "cloud-regime-map",
             mode=WANDB_MODE,
             config=dict(
-                base_dir=BASE_DIR,
+                embed_dir=EMBED_DIR,
+                manifest=MANIFEST,
                 out_dir=OUT_DIR,
-                start_date=str(START_DATE),
-                end_date=str(END_DATE),
+                stream_stride=STREAM_STRIDE,
                 subsample_rate=SUBSAMPLE_RATE,
-                day_stride=DAY_STRIDE,
+                max_per_day=MAX_PER_DAY,
                 random_seed=RANDOM_SEED,
                 out_name=OUT_NAME,
             ),
         )
 
-    paths = list(iter_day_paths())
-    print(f"Configured {len(paths)} days (stride={DAY_STRIDE}, "
-          f"subsample={SUBSAMPLE_RATE:.3f}) under {BASE_DIR}")
+    print(f"Embeddings PVC path: {EMBED_DIR}")
+    print(f"Manifest: {MANIFEST}")
+    queue = load_manifest_queue()
+    print(f"Targeting {len(queue)} OK days (stride={STREAM_STRIDE})")
 
     all_vectors = []
     all_lats = []
@@ -111,40 +150,29 @@ def main():
     n_loaded = 0
 
     check_memory("start")
-    for i, (t_file, c_file, day_str) in enumerate(paths):
-        if i % 25 == 0:
-            print(f"[{i}/{len(paths)}] Processing {day_str}...")
+    for i, row in queue.iterrows():
+        if i % 50 == 0:
+            print(f"[{i}/{len(queue)}] Loading {int(row['year'])}-"
+                  f"{int(row['month']):02d}-{int(row['day']):02d}...")
 
-        if not os.path.exists(t_file) or not os.path.exists(c_file):
+        day = load_day_tile2vec(int(row["year"]), int(row["month"]), int(row["day"]))
+        if day is None:
             continue
 
-        try:
-            vecs = np.load(t_file)
-            with open(c_file, "r", encoding="utf-8") as f:
-                centers_dict = json.load(f)
+        n = len(day["t2v"])
+        n_samples = max(1, int(n * SUBSAMPLE_RATE))
+        n_samples = min(n_samples, n, MAX_PER_DAY)
+        indices = rng.choice(n, size=n_samples, replace=False)
 
-            day_coords = load_day_coords(centers_dict)
-            n = min(len(vecs), len(day_coords))
-            if n == 0:
-                continue
-            vecs = vecs[:n]
-            day_coords = day_coords[:n]
-
-            n_samples = max(1, int(n * SUBSAMPLE_RATE))
-            n_samples = min(n_samples, n)
-            indices = rng.choice(n, size=n_samples, replace=False)
-
-            all_vectors.append(np.asarray(vecs[indices], dtype=np.float32))
-            all_lats.append(day_coords[indices, 0])
-            all_lons.append(day_coords[indices, 1])
-            n_loaded += 1
-        except Exception as exc:
-            print(f"Error on {day_str}: {exc}")
+        all_vectors.append(day["t2v"][indices])
+        all_lats.append(day["lat"][indices])
+        all_lons.append(day["lon"][indices])
+        n_loaded += 1
 
     if not all_vectors:
         raise RuntimeError(
-            f"No embedding days loaded from {BASE_DIR}. "
-            "Check BASE_DIR and that tile2vec/centers files exist."
+            f"No embedding days loaded from {EMBED_DIR}. "
+            "Check EMBED_DIR and manifest OK rows."
         )
 
     print(f"Loaded {n_loaded} days. Stacking arrays...")
@@ -171,10 +199,13 @@ def main():
     print("Plotting global cloud regimes...")
     fig, ax = plt.subplots(figsize=(20, 10), facecolor="white")
     ax.set_facecolor("white")
-    ax.scatter(lons, lats, c=colors, s=0.05, alpha=0.8, marker="s", linewidths=0)
+    ax.scatter(
+        lons, lats, c=colors, s=0.05, alpha=0.8, marker="s",
+        linewidths=0, rasterized=True,
+    )
 
     ax.set_title(
-        "Global Cloud Regimes (2002-2022) - PCA Projected Embeddings",
+        "Global Cloud Regimes (2002-2022) - PCA Projected Tile2Vec Embeddings",
         color="black",
         fontsize=20,
     )
