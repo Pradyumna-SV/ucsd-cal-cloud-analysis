@@ -15,6 +15,11 @@ Environment variables (all optional):
   MAX_PER_DAY     cap tiles kept per day     default: 2000
   RANDOM_SEED     subsample seed             default: 42
   OUT_NAME        output png filename        default: cloud_regime_map_20years.png
+  COLOR_PCT_LOW   PCA color percentile low   default: 2
+  COLOR_PCT_HIGH  PCA color percentile high  default: 98
+  COLOR_GAMMA     <1 darkens midtones        default: 0.65
+  PLOT_MARKER_SIZE scatter marker area       default: auto from n_points
+  PLOT_ALPHA      scatter alpha              default: auto from n_points
   WANDB_PROJECT   W&B project                default: unset (skip logging)
   WANDB_RUN_NAME  W&B run name               default: cloud-regime-map
   WANDB_MODE      online/offline/disabled    default: online
@@ -41,6 +46,11 @@ SUBSAMPLE_RATE = float(os.environ.get("SUBSAMPLE_RATE", "0.05"))
 MAX_PER_DAY = max(1, int(os.environ.get("MAX_PER_DAY", "2000")))
 RANDOM_SEED = int(os.environ.get("RANDOM_SEED", "42"))
 OUT_NAME = os.environ.get("OUT_NAME", "cloud_regime_map_20years.png")
+COLOR_PCT_LOW = float(os.environ.get("COLOR_PCT_LOW", "2"))
+COLOR_PCT_HIGH = float(os.environ.get("COLOR_PCT_HIGH", "98"))
+COLOR_GAMMA = float(os.environ.get("COLOR_GAMMA", "0.65"))
+_PLOT_MARKER_SIZE = os.environ.get("PLOT_MARKER_SIZE", "").strip()
+_PLOT_ALPHA = os.environ.get("PLOT_ALPHA", "").strip()
 WANDB_PROJECT = os.environ.get("WANDB_PROJECT", None)
 WANDB_RUN_NAME = os.environ.get("WANDB_RUN_NAME", None)
 WANDB_MODE = os.environ.get("WANDB_MODE", "online")
@@ -99,6 +109,25 @@ def load_day_tile2vec(year, month, day):
         "lat": np.asarray(lats[:n], dtype=np.float64),
         "lon": np.asarray(lons[:n], dtype=np.float64),
     }
+
+
+def pca_scores_to_rgb(rgb_pca):
+    """Stretch PCA channels by percentile so outliers do not wash out the map."""
+    colors = np.empty_like(rgb_pca, dtype=np.float64)
+    for j in range(rgb_pca.shape[1]):
+        lo, hi = np.percentile(rgb_pca[:, j], [COLOR_PCT_LOW, COLOR_PCT_HIGH])
+        colors[:, j] = (rgb_pca[:, j] - lo) / max(hi - lo, 1e-8)
+    colors = np.clip(colors, 0.0, 1.0)
+    if COLOR_GAMMA > 0:
+        colors = np.power(colors, COLOR_GAMMA)
+    return colors.astype(np.float32)
+
+
+def auto_plot_style(n_points):
+    """Many overlapping points need low alpha; a few points can be brighter."""
+    marker_size = float(_PLOT_MARKER_SIZE) if _PLOT_MARKER_SIZE else min(1.5, max(0.15, 250_000 / n_points))
+    alpha = float(_PLOT_ALPHA) if _PLOT_ALPHA else min(0.35, max(0.01, 80_000 / n_points))
+    return marker_size, alpha
 
 
 def load_manifest_queue():
@@ -189,35 +218,39 @@ def main():
     rgb_pca = pca.fit_transform(X)
     del X
     check_memory("post-pca")
+    print(
+        "PCA variance explained:",
+        " ".join(f"PC{i+1}={v:.1%}" for i, v in enumerate(pca.explained_variance_ratio_)),
+    )
 
-    rgb_min = rgb_pca.min(axis=0)
-    rgb_max = rgb_pca.max(axis=0)
-    denom = np.maximum(rgb_max - rgb_min, 1e-8)
-    colors = (rgb_pca - rgb_min) / denom
+    colors = pca_scores_to_rgb(rgb_pca)
     del rgb_pca
 
+    marker_size, alpha = auto_plot_style(len(lats))
+    print(f"Plot style: marker_size={marker_size:.3f}, alpha={alpha:.3f}")
+
     print("Plotting global cloud regimes...")
-    fig, ax = plt.subplots(figsize=(20, 10), facecolor="black")
-    ax.set_facecolor("black")
+    fig, ax = plt.subplots(figsize=(20, 10), facecolor="white")
+    ax.set_facecolor("white")
     ax.scatter(
-        lons, lats, c=colors, s=0.05, alpha=0.8, marker="s",
+        lons, lats, c=colors, s=marker_size, alpha=alpha, marker="s",
         linewidths=0, rasterized=True,
     )
 
     ax.set_title(
         "Global Cloud Regimes (2002-2022) - PCA Projected Tile2Vec Embeddings",
-        color="white",
+        color="black",
         fontsize=20,
     )
-    ax.set_xlabel("Longitude", color="white")
-    ax.set_ylabel("Latitude", color="white")
+    ax.set_xlabel("Longitude", color="black")
+    ax.set_ylabel("Latitude", color="black")
     ax.grid(False)
     ax.set_xlim(-180, 180)
     ax.set_ylim(-90, 90)
-    ax.tick_params(axis="both", colors="white")
+    ax.tick_params(axis="both", colors="black")
 
     out_path = os.path.join(OUT_DIR, OUT_NAME)
-    fig.savefig(out_path, dpi=300, facecolor="black", bbox_inches="tight")
+    fig.savefig(out_path, dpi=300, facecolor="white", bbox_inches="tight")
     plt.close(fig)
     print(f"Map saved -> {out_path}")
 
@@ -239,6 +272,8 @@ def main():
             "pca_var_ratio_pc1": float(pca.explained_variance_ratio_[0]),
             "pca_var_ratio_pc2": float(pca.explained_variance_ratio_[1]),
             "pca_var_ratio_pc3": float(pca.explained_variance_ratio_[2]),
+            "plot_marker_size": marker_size,
+            "plot_alpha": alpha,
             "cloud_regime_map": wandb.Image(out_path),
         })
         wandb.log_artifact(artifact)
