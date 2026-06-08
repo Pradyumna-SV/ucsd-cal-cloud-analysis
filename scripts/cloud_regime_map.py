@@ -12,9 +12,9 @@ Environment variables (all optional):
   EMBED_DIR         embeddings root on PVC       default: /workspace/embeddings
   MANIFEST          manifest.csv path            default: /workspace/repo/manifest.csv
   OUT_DIR           output directory             default: /workspace/results/cloud_regime_map
-  STREAM_STRIDE     every Nth OK manifest day    default: 1
+  STREAM_STRIDE     every Nth OK manifest day    default: 11
   SUBSAMPLE_RATE    fraction per day             default: 0.05
-  MAX_PER_DAY       cap tiles/day; 0 = no cap    default: 5000
+  MAX_PER_DAY       cap tiles/day; 0 = no cap    default: 2000
   RANDOM_SEED       subsample seed               default: 42
   OUT_NAME          output png filename          default: cloud_regime_map_20years.png
   PLOT_BACKGROUND   white or black               default: white
@@ -47,9 +47,9 @@ from sklearn.decomposition import PCA
 EMBED_DIR = os.environ.get("EMBED_DIR", os.environ.get("BASE_DIR", "/workspace/embeddings"))
 MANIFEST = os.environ.get("MANIFEST", "/workspace/repo/manifest.csv")
 OUT_DIR = os.environ.get("OUT_DIR", "/workspace/results/cloud_regime_map")
-STREAM_STRIDE = max(1, int(os.environ.get("STREAM_STRIDE", os.environ.get("DAY_STRIDE", "1"))))
+STREAM_STRIDE = max(1, int(os.environ.get("STREAM_STRIDE", os.environ.get("DAY_STRIDE", "11"))))
 SUBSAMPLE_RATE = float(os.environ.get("SUBSAMPLE_RATE", "0.05"))
-_MAX_PER_DAY = os.environ.get("MAX_PER_DAY", "5000").strip()
+_MAX_PER_DAY = os.environ.get("MAX_PER_DAY", "2000").strip()
 MAX_PER_DAY = int(_MAX_PER_DAY) if _MAX_PER_DAY and _MAX_PER_DAY != "0" else None
 RANDOM_SEED = int(os.environ.get("RANDOM_SEED", "42"))
 OUT_NAME = os.environ.get("OUT_NAME", "cloud_regime_map_20years.png")
