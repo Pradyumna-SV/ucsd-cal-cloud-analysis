@@ -1,0 +1,91 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: prad-cloud-regime-map
+  namespace: climate-analytics
+spec:
+  backoffLimit: 0
+  ttlSecondsAfterFinished: 86400
+  template:
+    spec:
+      restartPolicy: Never
+      containers:
+      - name: cloud-regime-map
+        image: python:3.10-slim
+        env:
+        - name: PYTHONUNBUFFERED
+          value: "1"
+        - name: MPLCONFIGDIR
+          value: /tmp/mplconfig
+        - name: BASE_DIR
+          value: /workspace/embeddings
+        - name: OUT_DIR
+          value: /workspace/results/cloud_regime_map
+        - name: START_DATE
+          value: "2002-01-01"
+        - name: END_DATE
+          value: "2022-12-31"
+        - name: SUBSAMPLE_RATE
+          value: "0.05"
+        - name: DAY_STRIDE
+          value: "11"
+        - name: RANDOM_SEED
+          value: "42"
+        - name: OUT_NAME
+          value: cloud_regime_map_20years.png
+        - name: WANDB_PROJECT
+          value: "ucsd-cal-cloud-cca"
+        - name: WANDB_RUN_NAME
+          value: "cloud-regime-map-global"
+        - name: WANDB_MODE
+          value: "online"
+        - name: WANDB_API_KEY
+          valueFrom:
+            secretKeyRef:
+              name: wandb-secret-prad-ccacloud
+              key: api-key
+        command: ["/bin/bash", "-c"]
+        args:
+          - |
+            set -eo pipefail
+
+            apt-get update -q && apt-get install -y -q git
+            mkdir -p /tmp/mplconfig
+
+            REPO_DIR=/tmp/repo
+            rm -rf "$REPO_DIR"
+            git clone --depth 1 https://github.com/Pradyumna-SV/ucsd-cal-cloud-analysis "$REPO_DIR"
+
+            pip install --quiet numpy scikit-learn matplotlib psutil wandb
+
+            mkdir -p /workspace/results/cloud_regime_map
+            mkdir -p /workspace/logs
+
+            {
+              python3 "$REPO_DIR/scripts/cloud_regime_map.py"
+            } 2>&1 | tee "/workspace/logs/cloud_regime_map_$(hostname)_$(date +%Y%m%d_%H%M%S).log"
+        resources:
+          limits:
+            cpu: "8"
+            memory: "32Gi"
+          requests:
+            cpu: "4"
+            memory: "32Gi"
+        volumeMounts:
+        - name: embeddings-storage
+          mountPath: /workspace
+      volumes:
+      - name: embeddings-storage
+        persistentVolumeClaim:
+          claimName: prad-embeddings-5ti
+      tolerations:
+        - key: "nautilus.io/noceph"
+          operator: Exists
+          effect: NoSchedule
+        - key: "nautilus.io/group"
+          operator: Exists
+          effect: NoSchedule
+        - key: "kubernetes.io/arch"
+          value: "amd64"
+          operator: Equal
+          effect: NoSchedule
