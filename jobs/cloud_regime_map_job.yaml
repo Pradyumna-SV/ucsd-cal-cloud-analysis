@@ -22,15 +22,27 @@ spec:
         - name: OUT_DIR
           value: /workspace/results/cloud_regime_map
         - name: STREAM_STRIDE
-          value: "11"
+          value: "1"
         - name: SUBSAMPLE_RATE
           value: "0.05"
         - name: MAX_PER_DAY
-          value: "2000"
+          value: "5000"
         - name: RANDOM_SEED
           value: "42"
         - name: OUT_NAME
           value: cloud_regime_map_20years.png
+        - name: PLOT_BACKGROUND
+          value: "white"
+        - name: PLOT_MODE
+          value: "geo_grid"
+        - name: GRID_N_LON
+          value: "3600"
+        - name: GRID_N_LAT
+          value: "1800"
+        - name: COLOR_NORM
+          value: "global"
+        - name: COLOR_GAMMA
+          value: "0.8"
         - name: WANDB_PROJECT
           value: "ucsd-cal-cloud-cca"
         - name: WANDB_RUN_NAME

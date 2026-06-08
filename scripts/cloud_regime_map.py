@@ -2,27 +2,33 @@
 """
 Global cloud-regime map from Tile2Vec embeddings.
 
-Uses the same PVC layout and manifest day queue as scripts/cca_20yr.py:
-  /workspace/embeddings/YYYY/MM/DD/YYYY_MM_DD_tile2vec.npy
-  /workspace/embeddings/YYYY/MM/DD/YYYY_MM_DD_centers.json
+Uses the same PVC layout and manifest day queue as scripts/cca_20yr.py.
+
+White-background maps use geographic grid aggregation (mean RGB per lat/lon
+cell at full opacity). Scatter + alpha cannot reproduce the vivid black-bg
+look on white — overlapping transparent points wash out.
 
 Environment variables (all optional):
-  EMBED_DIR       embeddings root on PVC     default: /workspace/embeddings
-  MANIFEST        manifest.csv path          default: /workspace/repo/manifest.csv
-  OUT_DIR         output directory           default: /workspace/results/cloud_regime_map
-  STREAM_STRIDE   every Nth OK manifest day  default: 11
-  SUBSAMPLE_RATE  fraction per day           default: 0.05
-  MAX_PER_DAY     cap tiles kept per day     default: 2000
-  RANDOM_SEED     subsample seed             default: 42
-  OUT_NAME        output png filename        default: cloud_regime_map_20years.png
-  COLOR_PCT_LOW   PCA color percentile low   default: 2
-  COLOR_PCT_HIGH  PCA color percentile high  default: 98
-  COLOR_GAMMA     <1 darkens midtones        default: 0.65
-  PLOT_MARKER_SIZE scatter marker area       default: auto from n_points
-  PLOT_ALPHA      scatter alpha              default: auto from n_points
-  WANDB_PROJECT   W&B project                default: unset (skip logging)
-  WANDB_RUN_NAME  W&B run name               default: cloud-regime-map
-  WANDB_MODE      online/offline/disabled    default: online
+  EMBED_DIR         embeddings root on PVC       default: /workspace/embeddings
+  MANIFEST          manifest.csv path            default: /workspace/repo/manifest.csv
+  OUT_DIR           output directory             default: /workspace/results/cloud_regime_map
+  STREAM_STRIDE     every Nth OK manifest day    default: 1
+  SUBSAMPLE_RATE    fraction per day             default: 0.05
+  MAX_PER_DAY       cap tiles/day; 0 = no cap    default: 5000
+  RANDOM_SEED       subsample seed               default: 42
+  OUT_NAME          output png filename          default: cloud_regime_map_20years.png
+  PLOT_BACKGROUND   white or black               default: white
+  PLOT_MODE         geo_grid or scatter          default: geo_grid if white else scatter
+  GRID_N_LON        longitude bins for geo_grid  default: 3600
+  GRID_N_LAT        latitude bins for geo_grid   default: 1800
+  GRID_MIN_COUNT    min points to paint a cell   default: 1
+  COLOR_NORM        global or percentile         default: global
+  COLOR_GAMMA       <1 deepens colors on white   default: 0.8
+  PLOT_MARKER_SIZE  scatter only                 default: 0.05
+  PLOT_ALPHA        scatter only                 default: 0.8
+  WANDB_PROJECT     W&B project                  default: unset
+  WANDB_RUN_NAME    W&B run name                 default: cloud-regime-map
+  WANDB_MODE        online/offline/disabled      default: online
 """
 
 import json
@@ -41,16 +47,28 @@ from sklearn.decomposition import PCA
 EMBED_DIR = os.environ.get("EMBED_DIR", os.environ.get("BASE_DIR", "/workspace/embeddings"))
 MANIFEST = os.environ.get("MANIFEST", "/workspace/repo/manifest.csv")
 OUT_DIR = os.environ.get("OUT_DIR", "/workspace/results/cloud_regime_map")
-STREAM_STRIDE = max(1, int(os.environ.get("STREAM_STRIDE", os.environ.get("DAY_STRIDE", "11"))))
+STREAM_STRIDE = max(1, int(os.environ.get("STREAM_STRIDE", os.environ.get("DAY_STRIDE", "1"))))
 SUBSAMPLE_RATE = float(os.environ.get("SUBSAMPLE_RATE", "0.05"))
-MAX_PER_DAY = max(1, int(os.environ.get("MAX_PER_DAY", "2000")))
+_MAX_PER_DAY = os.environ.get("MAX_PER_DAY", "5000").strip()
+MAX_PER_DAY = int(_MAX_PER_DAY) if _MAX_PER_DAY and _MAX_PER_DAY != "0" else None
 RANDOM_SEED = int(os.environ.get("RANDOM_SEED", "42"))
 OUT_NAME = os.environ.get("OUT_NAME", "cloud_regime_map_20years.png")
-COLOR_PCT_LOW = float(os.environ.get("COLOR_PCT_LOW", "2"))
-COLOR_PCT_HIGH = float(os.environ.get("COLOR_PCT_HIGH", "98"))
-COLOR_GAMMA = float(os.environ.get("COLOR_GAMMA", "0.65"))
-_PLOT_MARKER_SIZE = os.environ.get("PLOT_MARKER_SIZE", "").strip()
-_PLOT_ALPHA = os.environ.get("PLOT_ALPHA", "").strip()
+PLOT_BACKGROUND = os.environ.get("PLOT_BACKGROUND", "white").strip().lower()
+_COLOR_GAMMA = os.environ.get("COLOR_GAMMA", "0.8").strip()
+COLOR_GAMMA = float(_COLOR_GAMMA) if _COLOR_GAMMA else 1.0
+COLOR_NORM = os.environ.get("COLOR_NORM", "global").strip().lower()
+GRID_N_LON = max(100, int(os.environ.get("GRID_N_LON", "3600")))
+GRID_N_LAT = max(50, int(os.environ.get("GRID_N_LAT", "1800")))
+GRID_MIN_COUNT = max(1, int(os.environ.get("GRID_MIN_COUNT", "1")))
+PLOT_MARKER_SIZE = float(os.environ.get("PLOT_MARKER_SIZE", "0.05"))
+PLOT_ALPHA = float(os.environ.get("PLOT_ALPHA", "0.8"))
+_PLOT_MODE = os.environ.get("PLOT_MODE", "").strip().lower()
+if _PLOT_MODE:
+    PLOT_MODE = _PLOT_MODE
+elif PLOT_BACKGROUND == "white":
+    PLOT_MODE = "geo_grid"
+else:
+    PLOT_MODE = "scatter"
 WANDB_PROJECT = os.environ.get("WANDB_PROJECT", None)
 WANDB_RUN_NAME = os.environ.get("WANDB_RUN_NAME", None)
 WANDB_MODE = os.environ.get("WANDB_MODE", "online")
@@ -64,10 +82,7 @@ def check_memory(label=""):
 
 
 def load_day_tile2vec(year, month, day):
-    """
-    Load one day's Tile2Vec embeddings + lat/lon.
-    Mirrors scripts/cca_20yr.py::load_day (tile2vec path only).
-    """
+    """Load one day's Tile2Vec embeddings + lat/lon (matches cca_20yr.py)."""
     prefix = f"{year}_{month:02d}_{day:02d}"
     day_dir = Path(EMBED_DIR) / str(year) / f"{month:02d}" / f"{day:02d}"
     t2v_p = day_dir / f"{prefix}_tile2vec.npy"
@@ -112,22 +127,53 @@ def load_day_tile2vec(year, month, day):
 
 
 def pca_scores_to_rgb(rgb_pca):
-    """Stretch PCA channels by percentile so outliers do not wash out the map."""
-    colors = np.empty_like(rgb_pca, dtype=np.float64)
-    for j in range(rgb_pca.shape[1]):
-        lo, hi = np.percentile(rgb_pca[:, j], [COLOR_PCT_LOW, COLOR_PCT_HIGH])
-        colors[:, j] = (rgb_pca[:, j] - lo) / max(hi - lo, 1e-8)
-    colors = np.clip(colors, 0.0, 1.0)
-    if COLOR_GAMMA > 0:
-        colors = np.power(colors, COLOR_GAMMA)
+    """Map PCA scores to RGB. 'global' matches the original notebook script."""
+    if COLOR_NORM == "percentile":
+        colors = np.empty_like(rgb_pca, dtype=np.float64)
+        for j in range(rgb_pca.shape[1]):
+            lo, hi = np.percentile(rgb_pca[:, j], [2, 98])
+            colors[:, j] = (rgb_pca[:, j] - lo) / max(hi - lo, 1e-8)
+        colors = np.clip(colors, 0.0, 1.0)
+    else:
+        rgb_min = rgb_pca.min(axis=0)
+        rgb_max = rgb_pca.max(axis=0)
+        colors = (rgb_pca - rgb_min) / np.maximum(rgb_max - rgb_min, 1e-8)
     return colors.astype(np.float32)
 
 
-def auto_plot_style(n_points):
-    """Many overlapping points need low alpha; a few points can be brighter."""
-    marker_size = float(_PLOT_MARKER_SIZE) if _PLOT_MARKER_SIZE else min(1.5, max(0.15, 250_000 / n_points))
-    alpha = float(_PLOT_ALPHA) if _PLOT_ALPHA else min(0.35, max(0.01, 80_000 / n_points))
-    return marker_size, alpha
+def build_geo_rgb_image(lons, lats, colors):
+    """
+    Average RGB into a lat/lon grid at full opacity.
+    Empty cells stay white — this is what makes white-bg maps vivid.
+    """
+    lon_idx = np.floor((lons + 180.0) / 360.0 * GRID_N_LON).astype(np.int32)
+    lat_idx = np.floor((lats + 90.0) / 180.0 * GRID_N_LAT).astype(np.int32)
+    lon_idx = np.clip(lon_idx, 0, GRID_N_LON - 1)
+    lat_idx = np.clip(lat_idx, 0, GRID_N_LAT - 1)
+
+    sum_r = np.zeros((GRID_N_LAT, GRID_N_LON), dtype=np.float64)
+    sum_g = np.zeros((GRID_N_LAT, GRID_N_LON), dtype=np.float64)
+    sum_b = np.zeros((GRID_N_LAT, GRID_N_LON), dtype=np.float64)
+    counts = np.zeros((GRID_N_LAT, GRID_N_LON), dtype=np.int32)
+
+    np.add.at(sum_r, (lat_idx, lon_idx), colors[:, 0].astype(np.float64))
+    np.add.at(sum_g, (lat_idx, lon_idx), colors[:, 1].astype(np.float64))
+    np.add.at(sum_b, (lat_idx, lon_idx), colors[:, 2].astype(np.float64))
+    np.add.at(counts, (lat_idx, lon_idx), 1)
+
+    mask = counts >= GRID_MIN_COUNT
+    img = np.ones((GRID_N_LAT, GRID_N_LON, 3), dtype=np.float32)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        img[..., 0] = np.where(mask, sum_r / np.maximum(counts, 1), 1.0)
+        img[..., 1] = np.where(mask, sum_g / np.maximum(counts, 1), 1.0)
+        img[..., 2] = np.where(mask, sum_b / np.maximum(counts, 1), 1.0)
+
+    if COLOR_GAMMA > 0 and COLOR_GAMMA != 1.0:
+        data_mask = np.broadcast_to(mask[..., None], img.shape)
+        img[data_mask] = np.power(np.clip(img[data_mask], 0.0, 1.0), COLOR_GAMMA)
+
+    img = np.clip(img, 0.0, 1.0)
+    return img, int(mask.sum())
 
 
 def load_manifest_queue():
@@ -144,6 +190,57 @@ def load_manifest_queue():
     )
     queue = queue.iloc[::STREAM_STRIDE].reset_index(drop=True)
     return queue
+
+
+def save_map(lons, lats, colors, pca, n_loaded):
+    dark_bg = PLOT_BACKGROUND != "white"
+    bg = "black" if dark_bg else "white"
+    fg = "white" if dark_bg else "black"
+
+    print(
+        f"Plot style: mode={PLOT_MODE}, background={bg}, color_norm={COLOR_NORM}, "
+        f"color_gamma={COLOR_GAMMA}"
+    )
+
+    fig, ax = plt.subplots(figsize=(20, 10), facecolor=bg)
+    ax.set_facecolor(bg)
+    grid_cells = None
+
+    if PLOT_MODE == "geo_grid":
+        print(f"Aggregating to geo grid {GRID_N_LON} x {GRID_N_LAT}...")
+        img, grid_cells = build_geo_rgb_image(lons, lats, colors)
+        print(f"Painted {grid_cells:,} grid cells")
+        ax.imshow(
+            img,
+            origin="lower",
+            extent=[-180, 180, -90, 90],
+            aspect="auto",
+            interpolation="nearest",
+        )
+    else:
+        print(f"Scatter: marker_size={PLOT_MARKER_SIZE}, alpha={PLOT_ALPHA}")
+        ax.scatter(
+            lons, lats, c=colors, s=PLOT_MARKER_SIZE, alpha=PLOT_ALPHA, marker="s",
+            linewidths=0,
+        )
+        ax.set_xlim(-180, 180)
+        ax.set_ylim(-90, 90)
+
+    ax.set_title(
+        "Global Cloud Regimes (2002-2022) - PCA Projected Tile2Vec Embeddings",
+        color=fg,
+        fontsize=20,
+    )
+    ax.set_xlabel("Longitude", color=fg)
+    ax.set_ylabel("Latitude", color=fg)
+    ax.grid(False)
+    ax.tick_params(axis="both", colors=fg)
+
+    out_path = os.path.join(OUT_DIR, OUT_NAME)
+    fig.savefig(out_path, dpi=300, facecolor=bg, bbox_inches="tight")
+    plt.close(fig)
+    print(f"Map saved -> {out_path}")
+    return out_path, grid_cells
 
 
 def main():
@@ -165,13 +262,20 @@ def main():
                 max_per_day=MAX_PER_DAY,
                 random_seed=RANDOM_SEED,
                 out_name=OUT_NAME,
+                plot_background=PLOT_BACKGROUND,
+                plot_mode=PLOT_MODE,
+                grid_n_lon=GRID_N_LON,
+                grid_n_lat=GRID_N_LAT,
+                color_norm=COLOR_NORM,
+                color_gamma=COLOR_GAMMA,
             ),
         )
 
     print(f"Embeddings PVC path: {EMBED_DIR}")
     print(f"Manifest: {MANIFEST}")
     queue = load_manifest_queue()
-    print(f"Targeting {len(queue)} OK days (stride={STREAM_STRIDE})")
+    cap_msg = "no cap" if MAX_PER_DAY is None else str(MAX_PER_DAY)
+    print(f"Targeting {len(queue)} OK days (stride={STREAM_STRIDE}, max_per_day={cap_msg})")
 
     all_vectors = []
     all_lats = []
@@ -190,7 +294,9 @@ def main():
 
         n = len(day["t2v"])
         n_samples = max(1, int(n * SUBSAMPLE_RATE))
-        n_samples = min(n_samples, n, MAX_PER_DAY)
+        if MAX_PER_DAY is not None:
+            n_samples = min(n_samples, MAX_PER_DAY)
+        n_samples = min(n_samples, n)
         indices = rng.choice(n, size=n_samples, replace=False)
 
         all_vectors.append(day["t2v"][indices])
@@ -226,33 +332,7 @@ def main():
     colors = pca_scores_to_rgb(rgb_pca)
     del rgb_pca
 
-    marker_size, alpha = auto_plot_style(len(lats))
-    print(f"Plot style: marker_size={marker_size:.3f}, alpha={alpha:.3f}")
-
-    print("Plotting global cloud regimes...")
-    fig, ax = plt.subplots(figsize=(20, 10), facecolor="white")
-    ax.set_facecolor("white")
-    ax.scatter(
-        lons, lats, c=colors, s=marker_size, alpha=alpha, marker="s",
-        linewidths=0, rasterized=True,
-    )
-
-    ax.set_title(
-        "Global Cloud Regimes (2002-2022) - PCA Projected Tile2Vec Embeddings",
-        color="black",
-        fontsize=20,
-    )
-    ax.set_xlabel("Longitude", color="black")
-    ax.set_ylabel("Latitude", color="black")
-    ax.grid(False)
-    ax.set_xlim(-180, 180)
-    ax.set_ylim(-90, 90)
-    ax.tick_params(axis="both", colors="black")
-
-    out_path = os.path.join(OUT_DIR, OUT_NAME)
-    fig.savefig(out_path, dpi=300, facecolor="white", bbox_inches="tight")
-    plt.close(fig)
-    print(f"Map saved -> {out_path}")
+    out_path, grid_cells = save_map(lons, lats, colors, pca, n_loaded)
 
     if WANDB_PROJECT:
         import wandb
@@ -266,16 +346,19 @@ def main():
             ),
         )
         artifact.add_file(out_path, name=OUT_NAME)
-        wandb.log({
+        log_payload = {
             "n_days_loaded": n_loaded,
             "n_points": int(lats.shape[0]),
             "pca_var_ratio_pc1": float(pca.explained_variance_ratio_[0]),
             "pca_var_ratio_pc2": float(pca.explained_variance_ratio_[1]),
             "pca_var_ratio_pc3": float(pca.explained_variance_ratio_[2]),
-            "plot_marker_size": marker_size,
-            "plot_alpha": alpha,
+            "plot_background": PLOT_BACKGROUND,
+            "plot_mode": PLOT_MODE,
             "cloud_regime_map": wandb.Image(out_path),
-        })
+        }
+        if grid_cells is not None:
+            log_payload["grid_cells_painted"] = grid_cells
+        wandb.log(log_payload)
         wandb.log_artifact(artifact)
         wandb.finish()
 
